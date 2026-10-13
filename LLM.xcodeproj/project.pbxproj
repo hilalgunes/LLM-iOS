@@ -6,6 +6,17 @@
 	objectVersion = 110;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		BDCE4AB030776ABA00E8452C /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = BDCE4AB330776ABA00E8452C /* MLXLLM */; };
+		BDCE4AB130776ABA00E8452C /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = BDCE4AB430776ABA00E8452C /* MLXLMCommon */; };
+		BDCE4AB230776ABA00E8452C /* MLXHuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = BDCE4AB530776ABA00E8452C /* MLXHuggingFace */; };
+		BDCE4AB730776ABA00E8452C /* HuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = BDCE4ABA30776ABA00E8452C /* HuggingFace */; };
+		BDCE4AB830776ABA00E8452C /* Tokenizers in Frameworks */ = {isa = PBXBuildFile; productRef = BDCE4ABB30776ABA00E8452C /* Tokenizers */; };
+		BDCE4ABE30776ABA00E8452C /* MLXEmbedders in Frameworks */ = {isa = PBXBuildFile; productRef = BDCE4AC030776ABA00E8452C /* MLXEmbedders */; };
+		BDCE4ABF30776ABA00E8452C /* MLX in Frameworks */ = {isa = PBXBuildFile; productRef = BDCE4AC130776ABA00E8452C /* MLX */; };
+		BDCE4AC330776ABA00E8452C /* onnxruntime in Frameworks */ = {isa = PBXBuildFile; productRef = BDCE4AC530776ABA00E8452C /* onnxruntime */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		BDCE4A9E30776AB900E8452C /* LLM.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LLM.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -22,6 +33,14 @@
 		BDCE4A9B30776AB900E8452C /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				BDCE4AB030776ABA00E8452C /* MLXLLM in Frameworks */,
+				BDCE4AB130776ABA00E8452C /* MLXLMCommon in Frameworks */,
+				BDCE4AB230776ABA00E8452C /* MLXHuggingFace in Frameworks */,
+				BDCE4AB730776ABA00E8452C /* HuggingFace in Frameworks */,
+				BDCE4AB830776ABA00E8452C /* Tokenizers in Frameworks */,
+				BDCE4ABE30776ABA00E8452C /* MLXEmbedders in Frameworks */,
+				BDCE4ABF30776ABA00E8452C /* MLX in Frameworks */,
+				BDCE4AC330776ABA00E8452C /* onnxruntime in Frameworks */,
 			);
 		};
 /* End PBXFrameworksBuildPhase section */
@@ -60,6 +79,16 @@
 				BDCE4AA030776AB900E8452C /* LLM */,
 			);
 			name = LLM;
+			packageProductDependencies = (
+				BDCE4AB330776ABA00E8452C /* MLXLLM */,
+				BDCE4AB430776ABA00E8452C /* MLXLMCommon */,
+				BDCE4AB530776ABA00E8452C /* MLXHuggingFace */,
+				BDCE4ABA30776ABA00E8452C /* HuggingFace */,
+				BDCE4ABB30776ABA00E8452C /* Tokenizers */,
+				BDCE4AC030776ABA00E8452C /* MLXEmbedders */,
+				BDCE4AC130776ABA00E8452C /* MLX */,
+				BDCE4AC530776ABA00E8452C /* onnxruntime */,
+			);
 			productName = LLM;
 			productReference = BDCE4A9E30776AB900E8452C /* LLM.app */;
 			productType = "com.apple.product-type.application";
@@ -88,6 +117,13 @@
 			);
 			mainGroup = BDCE4A9530776AB900E8452C;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				BDCE4AB630776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift-lm" */,
+				BDCE4ABC30776ABA00E8452C /* XCRemoteSwiftPackageReference "swift-huggingface" */,
+				BDCE4ABD30776ABA00E8452C /* XCRemoteSwiftPackageReference "swift-transformers" */,
+				BDCE4AC230776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift" */,
+				BDCE4AC430776ABA00E8452C /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = BDCE4A9F30776AB900E8452C /* Products */;
 			projectDirPath = "";
@@ -244,6 +280,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Sesli soru dikte edebilmeniz için mikrofon erişimi gerekir.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Sesli sorunuzu metne çevirmek için konuşma tanıma kullanılır.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -288,6 +326,8 @@
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "Sesli soru dikte edebilmeniz için mikrofon erişimi gerekir.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "Sesli sorunuzu metne çevirmek için konuşma tanıma kullanılır.";
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphoneos*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSceneManifest_Generation[sdk=iphonesimulator*]" = YES;
 				"INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents[sdk=iphoneos*]" = YES;
@@ -339,6 +379,96 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		BDCE4AB630776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift-lm" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/ml-explore/mlx-swift-lm";
+			requirement = {
+				kind = revision;
+				revision = 028a828efa1801ca6d40dfdca82fa501059dbf1f;
+			};
+		};
+		BDCE4ABC30776ABA00E8452C /* XCRemoteSwiftPackageReference "swift-huggingface" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/huggingface/swift-huggingface";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.8.1;
+			};
+			traits = (
+			);
+		};
+		BDCE4ABD30776ABA00E8452C /* XCRemoteSwiftPackageReference "swift-transformers" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/huggingface/swift-transformers";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.3.4;
+			};
+			traits = (
+			);
+		};
+		BDCE4AC230776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/ml-explore/mlx-swift";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.32.3;
+			};
+		};
+		BDCE4AC430776ABA00E8452C /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/microsoft/onnxruntime-swift-package-manager";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.24.2;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		BDCE4AB330776ABA00E8452C /* MLXLLM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BDCE4AB630776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
+			productName = MLXLLM;
+		};
+		BDCE4AB430776ABA00E8452C /* MLXLMCommon */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BDCE4AB630776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
+			productName = MLXLMCommon;
+		};
+		BDCE4AB530776ABA00E8452C /* MLXHuggingFace */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BDCE4AB630776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
+			productName = MLXHuggingFace;
+		};
+		BDCE4ABA30776ABA00E8452C /* HuggingFace */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BDCE4ABC30776ABA00E8452C /* XCRemoteSwiftPackageReference "swift-huggingface" */;
+			productName = HuggingFace;
+		};
+		BDCE4ABB30776ABA00E8452C /* Tokenizers */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BDCE4ABD30776ABA00E8452C /* XCRemoteSwiftPackageReference "swift-transformers" */;
+			productName = Tokenizers;
+		};
+		BDCE4AC030776ABA00E8452C /* MLXEmbedders */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BDCE4AB630776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
+			productName = MLXEmbedders;
+		};
+		BDCE4AC130776ABA00E8452C /* MLX */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BDCE4AC230776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift" */;
+			productName = MLX;
+		};
+		BDCE4AC530776ABA00E8452C /* onnxruntime */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BDCE4AC430776ABA00E8452C /* XCRemoteSwiftPackageReference "onnxruntime-swift-package-manager" */;
+			productName = onnxruntime;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = BDCE4A9630776AB900E8452C /* Project object */;
 	validationLevel = 1;
