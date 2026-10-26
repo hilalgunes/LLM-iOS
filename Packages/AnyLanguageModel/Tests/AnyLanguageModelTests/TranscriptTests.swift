@@ -1,0 +1,260 @@
+import Foundation
+import Testing
+
+@testable import AnyLanguageModel
+
+@Suite("Transcript")
+struct TranscriptTests {
+    @Generable
+    struct Person {
+        var name: String
+    }
+
+    @Test func entryIDRoutesToAssociatedValues() throws {
+        let instructions = Transcript.Instructions(
+            id: "instructions-id",
+            segments: [.text(.init(id: "instructions-segment", content: "Be concise"))],
+            toolDefinitions: []
+        )
+        let prompt = Transcript.Prompt(
+            id: "prompt-id",
+            segments: [.text(.init(id: "prompt-segment", content: "Hello"))]
+        )
+        let arguments = try GeneratedContent(json: #"{"city":"Cupertino"}"#)
+        let toolCall = Transcript.ToolCall(id: "call-id", toolName: "getWeather", arguments: arguments)
+        let toolCalls = Transcript.ToolCalls(id: "tool-calls-id", [toolCall])
+        let toolOutput = Transcript.ToolOutput(
+            id: "tool-output-id",
+            toolName: "getWeather",
+            segments: [.text(.init(id: "tool-output-segment", content: "Sunny"))]
+        )
+        let response = Transcript.Response(
+            id: "response-id",
+            assetIDs: [],
+            segments: [.text(.init(id: "response-segment", content: "Done"))]
+        )
+
+        #expect(Transcript.Entry.instructions(instructions).id == "instructions-id")
+        #expect(Transcript.Entry.prompt(prompt).id == "prompt-id")
+        #expect(Transcript.Entry.toolCalls(toolCalls).id == "tool-calls-id")
+        #expect(Transcript.Entry.toolOutput(toolOutput).id == "tool-output-id")
+        #expect(Transcript.Entry.response(response).id == "response-id")
+    }
+
+    @Test func segmentIDRoutesToAssociatedValues() throws {
+        let text = Transcript.TextSegment(id: "text-id", content: "Hello")
+        let structured = Transcript.StructuredSegment(
+            id: "structured-id",
+            source: "source",
+            content: try GeneratedContent(json: #"{"ok":true}"#)
+        )
+        let image = Transcript.ImageSegment(id: "image-id", url: URL(string: "https://example.com/image.png")!)
+
+        #expect(Transcript.Segment.text(text).id == "text-id")
+        #expect(Transcript.Segment.structure(structured).id == "structured-id")
+        #expect(Transcript.Segment.image(image).id == "image-id")
+    }
+
+    #if canImport(FoundationModels)
+        @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+        @Test func bridgesStructuredSegmentToFoundationModels() throws {
+            let content = try GeneratedContent(json: #"{"name":"Ana"}"#)
+            let segments: [Transcript.Segment] = [
+                .structure(.init(id: "person-id", source: "Person", content: content))
+            ]
+
+            let converted = segments.toFoundationModels()
+            #expect(converted.count == 1)
+            guard case .structure(let segment) = try #require(converted.first) else {
+                Issue.record("Expected a structured segment")
+                return
+            }
+            #expect(segment.id == "person-id")
+            #if os(watchOS)
+                #expect(segment.schemaName == "Person")
+            #else
+                #expect(segment.source == "Person")
+            #endif
+            #expect(try GeneratedContent(segment.content) == content)
+        }
+    #endif
+
+    @Test func sessionRestoresInstructionsFromTranscript() throws {
+        let instructions = "First\n\nSecond trailing spaces   "
+        let transcript = Transcript(entries: [
+            .instructions(
+                .init(
+                    id: "instructions-id",
+                    segments: [.text(.init(content: instructions))],
+                    toolDefinitions: []
+                )
+            ),
+            .prompt(.init(segments: [.text(.init(content: "Hello"))])),
+        ])
+
+        let session = LanguageModelSession(model: MockLanguageModel(), transcript: transcript)
+
+        #expect(session.instructions?.description == instructions)
+        #expect(session.transcript.count == transcript.count)
+        #expect(session.transcript.first?.id == "instructions-id")
+    }
+
+    @Test func imageSourceRoundTripsForDataAndURL() throws {
+        let encoder = JSONEncoder()
+        let decoder = JSONDecoder()
+
+        let dataSource = Transcript.ImageSegment.Source.data(Data([0xDE, 0xAD]), mimeType: "image/png")
+        let encodedDataSource = try encoder.encode(dataSource)
+        let decodedDataSource = try decoder.decode(Transcript.ImageSegment.Source.self, from: encodedDataSource)
+        #expect(decodedDataSource == dataSource)
+
+        let urlSource = Transcript.ImageSegment.Source.url(URL(string: "https://example.com/a.jpg")!)
+        let encodedURLSource = try encoder.encode(urlSource)
+        let decodedURLSource = try decoder.decode(Transcript.ImageSegment.Source.self, from: encodedURLSource)
+        #expect(decodedURLSource == urlSource)
+    }
+
+    @Test func imageSourceDecodeThrowsForUnknownKind() {
+        let invalid = #"{"kind":"unknown"}"#.data(using: .utf8)!
+        let decoder = JSONDecoder()
+
+        do {
+            _ = try decoder.decode(Transcript.ImageSegment.Source.self, from: invalid)
+            Issue.record("Expected decoding to fail for unknown kind")
+        } catch let error as DecodingError {
+            if case .dataCorrupted = error {
+                #expect(Bool(true))
+            } else {
+                Issue.record("Expected dataCorrupted, got \(error)")
+            }
+        } catch {
+            Issue.record("Expected DecodingError, got \(error)")
+        }
+    }
+
+    @Test func responseFormatNameExtractsRefTypeNameOrFallsBack() {
+        let refFormat = Transcript.ResponseFormat(type: Person.self)
+        #expect(refFormat.name.contains("Person"))
+
+        let inlineSchema = GenerationSchema(type: String.self, anyOf: ["a", "b"])
+        let fallbackFormat = Transcript.ResponseFormat(schema: inlineSchema)
+        #expect(fallbackFormat.name == "response")
+    }
+
+    @Test func responseFormatAndToolDefinitionEquatableBehavior() {
+        let firstInlineSchema = GenerationSchema(type: String.self, anyOf: ["a"])
+        let secondInlineSchema = GenerationSchema(type: String.self, anyOf: ["b"])
+
+        let firstFormat = Transcript.ResponseFormat(schema: firstInlineSchema)
+        let secondFormat = Transcript.ResponseFormat(schema: secondInlineSchema)
+        #expect(firstFormat == secondFormat)
+
+        let firstToolDefinition = Transcript.ToolDefinition(
+            name: "tool",
+            description: "desc",
+            parameters: firstInlineSchema
+        )
+        let secondToolDefinition = Transcript.ToolDefinition(
+            name: "tool",
+            description: "desc",
+            parameters: secondInlineSchema
+        )
+        #expect(firstToolDefinition == secondToolDefinition)
+    }
+    @Test func toolCallOmitsProviderMetadataWhenAbsent() throws {
+        // Guards decoding of transcripts encoded before `providerMetadata` existed. Making the
+        // property non-optional breaks this: synthesized `Codable` demands a key for every
+        // non-optional property and never consults its default value.
+        let arguments = try GeneratedContent(json: #"{"city":"Cupertino"}"#)
+        let call = Transcript.ToolCall(id: "call-id", toolName: "getWeather", arguments: arguments)
+
+        let data = try JSONEncoder().encode(call)
+        var object = try #require(try JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(object["providerMetadata"] == nil)
+
+        object.removeValue(forKey: "providerMetadata")
+        let encodedBeforeTheFieldExisted = try JSONSerialization.data(withJSONObject: object)
+        let decoded = try JSONDecoder().decode(Transcript.ToolCall.self, from: encodedBeforeTheFieldExisted)
+        #expect(decoded.providerMetadata == nil)
+        #expect(decoded.toolName == "getWeather")
+    }
+
+    @Test func toolCallRoundTripsProviderMetadata() throws {
+        let arguments = try GeneratedContent(json: #"{"city":"Cupertino"}"#)
+        let call = Transcript.ToolCall(
+            id: "call-id",
+            toolName: "getWeather",
+            arguments: arguments,
+            providerMetadata: ["thoughtSignature": "opaque-signature"]
+        )
+
+        let data = try JSONEncoder().encode(call)
+        let decoded = try JSONDecoder().decode(Transcript.ToolCall.self, from: data)
+
+        #expect(decoded.providerMetadata == ["thoughtSignature": "opaque-signature"])
+    }
+
+    @Test func responseAndToolCallsRoundTripProviderMetadata() throws {
+        let metadata = ["provider.state": "opaque-signature"]
+        for metadata in [nil, metadata] {
+            let response = Transcript.Response(assetIDs: [], segments: [], providerMetadata: metadata)
+            let calls = Transcript.ToolCalls([Transcript.ToolCall](), providerMetadata: metadata)
+            let responseData = try JSONEncoder().encode(response)
+            let callsData = try JSONEncoder().encode(calls)
+            #expect(try JSONDecoder().decode(Transcript.Response.self, from: responseData) == response)
+            #expect(try JSONDecoder().decode(Transcript.ToolCalls.self, from: callsData) == calls)
+            if metadata == nil {
+                let responseJSON = try #require(try JSONSerialization.jsonObject(with: responseData) as? [String: Any])
+                let callsJSON = try #require(try JSONSerialization.jsonObject(with: callsData) as? [String: Any])
+                #expect(responseJSON["providerMetadata"] == nil)
+                #expect(callsJSON["providerMetadata"] == nil)
+            }
+        }
+    }
+
+    @Test(arguments: [
+        (GenerationOptions.SamplingMode.greedy, #"{"greedy":{}}"#),
+        (.random(top: 40, seed: 7), #"{"topK":{"_0":40,"seed":7}}"#),
+        (.random(probabilityThreshold: 0.9), #"{"nucleus":{"_0":0.9}}"#),
+    ])
+    func promptEncodesOptionsWithoutCustomOptions(
+        sampling: GenerationOptions.SamplingMode,
+        encodedMode: String
+    ) throws {
+        var options = GenerationOptions(sampling: sampling, temperature: 0.5, maximumResponseTokens: 64)
+        options[custom: OpenAILanguageModel.self] = .init(extraBody: ["key": "value"])
+        let prompt = Transcript.Prompt(id: "p", segments: [.text(.init(id: "s", content: "Hi"))], options: options)
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        let json = String(decoding: try encoder.encode(prompt), as: UTF8.self)
+        #expect(
+            json
+                == #"{"id":"p","options":{"maximumResponseTokens":64,"sampling":{"mode":"#
+                + encodedMode
+                + #"},"temperature":0.5},"segments":[{"text":{"_0":{"content":"Hi","id":"s"}}}]}"#
+        )
+
+        let decoded = try JSONDecoder().decode(Transcript.Prompt.self, from: Data(json.utf8))
+        #expect(decoded.options == GenerationOptions(sampling: sampling, temperature: 0.5, maximumResponseTokens: 64))
+        #expect(decoded.options[custom: OpenAILanguageModel.self] == nil)
+    }
+
+    @Test func promptDecodesOptionsWithEncodedCustomOptions() throws {
+        // Earlier releases encoded `GenerationOptions` with a `customOptionsStorage` key.
+        let json = #"""
+            {"id":"p","options":{"customOptionsStorage":{"AnyLanguageModel.OpenAILanguageModel.CustomGenerationOptions":
+            {"extra_body":{"key":"value"}}},"maximumResponseTokens":64,"sampling":{"mode":{"greedy":{}}},
+            "temperature":0.5},"segments":[]}
+            """#
+        let decoded = try JSONDecoder().decode(Transcript.Prompt.self, from: Data(json.utf8))
+        #expect(decoded.options == GenerationOptions(sampling: .greedy, temperature: 0.5, maximumResponseTokens: 64))
+        #expect(decoded.options[custom: OpenAILanguageModel.self] == nil)
+    }
+
+    @Test func promptRoundTripsDefaultOptions() throws {
+        let prompt = Transcript.Prompt(id: "p", segments: [])
+        let data = try JSONEncoder().encode(prompt)
+        #expect(try JSONDecoder().decode(Transcript.Prompt.self, from: data) == prompt)
+    }
+}

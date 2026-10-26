@@ -7,6 +7,10 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A10000000000000000000001 /* AnyLanguageModel in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000002 /* AnyLanguageModel */; };
+		A20000000000000000000001 /* MLXAudioTTS in Frameworks */ = {isa = PBXBuildFile; productRef = A20000000000000000000002 /* MLXAudioTTS */; };
+		A30000000000000000000001 /* MLXAudioCore in Frameworks */ = {isa = PBXBuildFile; productRef = A30000000000000000000002 /* MLXAudioCore */; };
+		A40000000000000000000001 /* MLXFoundationModels in Frameworks */ = {isa = PBXBuildFile; productRef = A40000000000000000000002 /* MLXFoundationModels */; };
 		BDCE4AB030776ABA00E8452C /* MLXLLM in Frameworks */ = {isa = PBXBuildFile; productRef = BDCE4AB330776ABA00E8452C /* MLXLLM */; };
 		BDCE4AB130776ABA00E8452C /* MLXLMCommon in Frameworks */ = {isa = PBXBuildFile; productRef = BDCE4AB430776ABA00E8452C /* MLXLMCommon */; };
 		BDCE4AB230776ABA00E8452C /* MLXHuggingFace in Frameworks */ = {isa = PBXBuildFile; productRef = BDCE4AB530776ABA00E8452C /* MLXHuggingFace */; };
@@ -33,6 +37,10 @@
 		BDCE4A9B30776AB900E8452C /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			files = (
+				A40000000000000000000001 /* MLXFoundationModels in Frameworks */,
+				A30000000000000000000001 /* MLXAudioCore in Frameworks */,
+				A20000000000000000000001 /* MLXAudioTTS in Frameworks */,
+				A10000000000000000000001 /* AnyLanguageModel in Frameworks */,
 				BDCE4AB030776ABA00E8452C /* MLXLLM in Frameworks */,
 				BDCE4AB130776ABA00E8452C /* MLXLMCommon in Frameworks */,
 				BDCE4AB230776ABA00E8452C /* MLXHuggingFace in Frameworks */,
@@ -80,6 +88,10 @@
 			);
 			name = LLM;
 			packageProductDependencies = (
+				A40000000000000000000002 /* MLXFoundationModels */,
+				A30000000000000000000002 /* MLXAudioCore */,
+				A20000000000000000000002 /* MLXAudioTTS */,
+				A10000000000000000000002 /* AnyLanguageModel */,
 				BDCE4AB330776ABA00E8452C /* MLXLLM */,
 				BDCE4AB430776ABA00E8452C /* MLXLMCommon */,
 				BDCE4AB530776ABA00E8452C /* MLXHuggingFace */,
@@ -118,6 +130,8 @@
 			mainGroup = BDCE4A9530776AB900E8452C;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+				A10000000000000000000003 /* XCLocalSwiftPackageReference "Packages/AnyLanguageModel" */,
+				A20000000000000000000003 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */,
 				BDCE4AB630776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift-lm" */,
 				BDCE4ABC30776ABA00E8452C /* XCRemoteSwiftPackageReference "swift-huggingface" */,
 				BDCE4ABD30776ABA00E8452C /* XCRemoteSwiftPackageReference "swift-transformers" */,
@@ -380,7 +394,22 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		A10000000000000000000003 /* XCLocalSwiftPackageReference "Packages/AnyLanguageModel" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = Packages/AnyLanguageModel;
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCRemoteSwiftPackageReference section */
+		A20000000000000000000003 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/Blaizzy/mlx-audio-swift";
+			requirement = {
+				kind = revision;
+				revision = 6fd938669e45412f5c35e011e7086ecd20397dbd;
+			};
+		};
 		BDCE4AB630776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift-lm" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/ml-explore/mlx-swift-lm";
@@ -428,6 +457,26 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		A10000000000000000000002 /* AnyLanguageModel */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A10000000000000000000003 /* XCLocalSwiftPackageReference "Packages/AnyLanguageModel" */;
+			productName = AnyLanguageModel;
+		};
+		A20000000000000000000002 /* MLXAudioTTS */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A20000000000000000000003 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */;
+			productName = MLXAudioTTS;
+		};
+		A30000000000000000000002 /* MLXAudioCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A20000000000000000000003 /* XCRemoteSwiftPackageReference "mlx-audio-swift" */;
+			productName = MLXAudioCore;
+		};
+		A40000000000000000000002 /* MLXFoundationModels */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = BDCE4AB630776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;
+			productName = MLXFoundationModels;
+		};
 		BDCE4AB330776ABA00E8452C /* MLXLLM */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = BDCE4AB630776ABA00E8452C /* XCRemoteSwiftPackageReference "mlx-swift-lm" */;

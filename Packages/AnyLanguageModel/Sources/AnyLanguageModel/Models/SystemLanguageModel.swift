@@ -1,0 +1,1351 @@
+#if canImport(FoundationModels)
+    import FoundationModels
+    import Foundation
+
+    import JSONSchema
+
+    /// A language model that uses Apple Intelligence.
+    ///
+    /// Use this model to generate text using on-device language models provided by Apple.
+    /// This model runs entirely on-device and doesn't send data to external servers.
+    ///
+    /// ```swift
+    /// let model = SystemLanguageModel()
+    /// ```
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
+    @available(watchOS, unavailable)
+    public struct SystemLanguageModel: LanguageModel {
+        /// The reason the model is unavailable.
+        public typealias UnavailableReason = FoundationModels.SystemLanguageModel.Availability.UnavailableReason
+
+        let systemModel: FoundationModels.SystemLanguageModel
+
+        /// The default system language model.
+        @available(watchOS, unavailable)
+        public static let `default` = SystemLanguageModel()
+
+        /// Creates the default system language model.
+        public init() {
+            self.systemModel = FoundationModels.SystemLanguageModel.default
+        }
+
+        /// Creates a system language model for a specific use case.
+        ///
+        /// - Parameters:
+        ///   - useCase: The intended use case for generation.
+        ///   - guardrails: Safety guardrails to apply during generation.
+        public init(
+            useCase: FoundationModels.SystemLanguageModel.UseCase = .general,
+            guardrails: FoundationModels.SystemLanguageModel.Guardrails = FoundationModels.SystemLanguageModel
+                .Guardrails.default
+        ) {
+            self.systemModel = FoundationModels.SystemLanguageModel(useCase: useCase, guardrails: guardrails)
+        }
+
+        /// Creates a system language model with a custom adapter.
+        ///
+        /// - Parameters:
+        ///   - adapter: The adapter to use with the base model.
+        ///   - guardrails: Safety guardrails to apply during generation.
+        public init(
+            adapter: FoundationModels.SystemLanguageModel.Adapter,
+            guardrails: FoundationModels.SystemLanguageModel.Guardrails = .default
+        ) {
+            self.systemModel = FoundationModels.SystemLanguageModel(adapter: adapter, guardrails: guardrails)
+        }
+
+        #if compiler(>=6.3) && !os(tvOS) && !os(watchOS)
+            /// The size of the context window in tokens.
+            /// The underlying property is back-deployed to OS 26.0
+            /// but only declared in the 26.4 SDK and later.
+            public var contextSize: Int {
+                systemModel.contextSize
+            }
+        #endif
+
+        /// The languages that the model supports.
+        public var supportedLanguages: Set<Locale.Language> {
+            systemModel.supportedLanguages
+        }
+
+        /// Returns a Boolean value that indicates whether the model supports a locale.
+        ///
+        /// - Parameter locale: The locale to check. Defaults to the current locale.
+        /// - Returns: `true` if the model supports the locale's language.
+        public func supportsLocale(_ locale: Locale = Locale.current) -> Bool {
+            systemModel.supportsLocale(locale)
+        }
+
+        #if compiler(>=6.3) && !os(tvOS) && !os(watchOS)
+            /// Returns the number of tokens in a prompt.
+            ///
+            /// - Parameter prompt: The prompt to count.
+            /// - Returns: The number of tokens.
+            @available(macOS 26.4, iOS 26.4, visionOS 26.4, *)
+            public func tokenCount(for prompt: some PromptRepresentable) async throws -> Int {
+                try await systemModel.tokenCount(for: prompt.promptRepresentation.toFoundationModels())
+            }
+
+            /// Returns the number of tokens in instructions.
+            ///
+            /// - Parameter instructions: The instructions to count.
+            /// - Returns: The number of tokens.
+            @available(macOS 26.4, iOS 26.4, visionOS 26.4, *)
+            public func tokenCount(for instructions: Instructions) async throws -> Int {
+                try await systemModel.tokenCount(for: instructions.toFoundationModels())
+            }
+
+            /// Returns the number of tokens that the definitions of tools use.
+            ///
+            /// - Parameter tools: The tools to count.
+            /// - Returns: The number of tokens.
+            @available(macOS 26.4, iOS 26.4, visionOS 26.4, *)
+            public func tokenCount(for tools: [any Tool]) async throws -> Int {
+                try await systemModel.tokenCount(for: tools.toFoundationModels())
+            }
+
+            /// Returns the number of tokens in a generation schema.
+            ///
+            /// - Parameter schema: The schema to count.
+            /// - Returns: The number of tokens.
+            @available(macOS 26.4, iOS 26.4, visionOS 26.4, *)
+            public func tokenCount(for schema: GenerationSchema) async throws -> Int {
+                try await systemModel.tokenCount(for: FoundationModels.GenerationSchema(schema))
+            }
+
+            /// Returns the number of tokens in transcript entries.
+            ///
+            /// - Parameter transcriptEntries: The entries to count.
+            /// - Returns: The number of tokens.
+            @available(macOS 26.4, iOS 26.4, visionOS 26.4, *)
+            public func tokenCount(
+                for transcriptEntries: some Collection<Transcript.Entry>
+            ) async throws -> Int {
+                let transcript = Transcript(entries: Array(transcriptEntries))
+                    .toFoundationModels(instructions: nil, toolDefinitions: [])
+                return try await systemModel.tokenCount(for: Array(transcript))
+            }
+        #endif
+
+        /// Whether the model accepts image input.
+        ///
+        /// - Note: This property is exclusive to AnyLanguageModel
+        ///   and using it means your code is no longer drop-in compatible
+        ///   with the Foundation Models framework.
+        ///   In Foundation Models 27, check whether `capabilities` contains `.vision` instead.
+        public var supportsImageInput: Bool {
+            #if compiler(>=6.4) && !os(tvOS) && !os(watchOS)
+                if #available(macOS 27.0, iOS 27.0, visionOS 27.0, *) {
+                    return systemModel.capabilities.contains(.vision)
+                }
+            #endif
+            return false
+        }
+
+        /// The availability status for the system language model.
+        public var availability: Availability<UnavailableReason> {
+            switch systemModel.availability {
+            case .available:
+                .available
+            case .unavailable(let reason):
+                .unavailable(reason)
+            }
+        }
+
+        public func respond<Content>(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            generating type: Content.Type,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
+            try await respond(
+                within: session,
+                to: prompt,
+                generating: type,
+                schema: type.generationSchema,
+                includeSchemaInPrompt: includeSchemaInPrompt,
+                options: options
+            )
+        }
+
+        public func respond(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            schema: GenerationSchema,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) async throws -> LanguageModelSession.Response<GeneratedContent> {
+            try await respond(
+                within: session,
+                to: prompt,
+                generating: GeneratedContent.self,
+                schema: schema,
+                includeSchemaInPrompt: includeSchemaInPrompt,
+                options: options
+            )
+        }
+
+        private func respond<Content>(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            generating type: Content.Type,
+            schema: GenerationSchema,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
+            let fmPrompt = try prompt.toFoundationModels()
+            let fmOptions = options.toFoundationModels()
+
+            return try await fmRespond(
+                makeSession: { try self.makeSession(for: session, prompt: prompt) },
+                fmPrompt: fmPrompt,
+                fmOptions: fmOptions,
+                type: type,
+                schema: schema,
+                includeSchemaInPrompt: includeSchemaInPrompt
+            )
+        }
+
+        public func streamResponse<Content>(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            generating type: Content.Type,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) -> sending LanguageModelSession.ResponseStream<Content> where Content: Generable {
+            streamResponse(
+                within: session,
+                to: prompt,
+                generating: type,
+                schema: type.generationSchema,
+                includeSchemaInPrompt: includeSchemaInPrompt,
+                options: options
+            )
+        }
+
+        public func streamResponse(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            schema: GenerationSchema,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) -> sending LanguageModelSession.ResponseStream<GeneratedContent> {
+            streamResponse(
+                within: session,
+                to: prompt,
+                generating: GeneratedContent.self,
+                schema: schema,
+                includeSchemaInPrompt: includeSchemaInPrompt,
+                options: options
+            )
+        }
+
+        private func streamResponse<Content>(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            generating type: Content.Type,
+            schema: GenerationSchema,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) -> sending LanguageModelSession.ResponseStream<Content> where Content: Generable {
+            let fmPrompt: FoundationModels.Prompt
+            do {
+                fmPrompt = try prompt.toFoundationModels()
+            } catch {
+                return .init(stream: AsyncThrowingStream { $0.finish(throwing: error) })
+            }
+            let fmOptions = options.toFoundationModels()
+
+            return fmStreamResponse(
+                makeSession: { try self.makeSession(for: session, prompt: prompt) },
+                fmPrompt: fmPrompt,
+                fmOptions: fmOptions,
+                type: type,
+                schema: schema,
+                includeSchemaInPrompt: includeSchemaInPrompt
+            )
+        }
+
+        public func logFeedbackAttachment(
+            within session: LanguageModelSession,
+            sentiment: LanguageModelFeedback.Sentiment?,
+            issues: [LanguageModelFeedback.Issue],
+            desiredOutput: Transcript.Entry?
+        ) -> Data {
+            let requestContext = session.resolvedRequestContext()
+            // Attach the feedback to the session's conversation, including its latest response.
+            let fmSession = FoundationModels.LanguageModelSession(
+                model: systemModel,
+                tools: requestContext.tools.toFoundationModels(),
+                transcript: requestContext.transcript.toFoundationModels(
+                    instructions: requestContext.instructions,
+                    toolDefinitions: requestContext.tools
+                        .filter(\.includesSchemaInInstructions)
+                        .map { Transcript.ToolDefinition(tool: $0) }
+                )
+            )
+
+            let fmSentiment = sentiment?.toFoundationModels()
+            let fmIssues = issues.map { $0.toFoundationModels() }
+            let fmDesiredOutput = desiredOutput?.toFoundationModels()
+
+            return fmSession.logFeedbackAttachment(
+                sentiment: fmSentiment,
+                issues: fmIssues,
+                desiredOutput: fmDesiredOutput
+            )
+        }
+
+        private func makeSession(
+            for session: LanguageModelSession,
+            prompt: Prompt
+        ) throws -> FoundationModels.LanguageModelSession {
+            #if compiler(>=6.4) && !os(tvOS)
+                if #available(macOS 27.0, iOS 27.0, visionOS 27.0, watchOS 27.0, *) {
+                    return makeFoundationModelsSession(
+                        model: systemModel,
+                        session: session,
+                        prompt: prompt
+                    )
+                }
+            #endif
+
+            // Before OS 27, Foundation Models can't resolve instructions and tools
+            // again for the request that continues after tool calls.
+            guard !session.usesDynamicInstructions else {
+                throw SystemLanguageModel.Error.dynamicInstructionsUnavailable
+            }
+            let requestContext = session.resolvedRequestContext()
+            return FoundationModels.LanguageModelSession(
+                model: systemModel,
+                tools: requestContext.tools.toFoundationModels(),
+                transcript: fmTranscriptDroppingDuplicatePrompt(
+                    requestContext.transcript,
+                    prompt: prompt
+                ).toFoundationModels(
+                    instructions: requestContext.instructions,
+                    toolDefinitions: requestContext.tools
+                        .filter(\.includesSchemaInInstructions)
+                        .map { Transcript.ToolDefinition(tool: $0) }
+                )
+            )
+        }
+
+    }
+
+    // MARK: - Helpers
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    func fmTranscriptDroppingDuplicatePrompt(_ transcript: Transcript, prompt: Prompt) -> Transcript {
+        guard let lastEntry = transcript.last, case .prompt(let lastPrompt) = lastEntry else {
+            return transcript
+        }
+        guard
+            prompt.matchesTranscriptOccurrence(
+                lastPrompt.segments,
+                occurrenceID: lastPrompt.id
+            )
+        else {
+            return transcript
+        }
+        return Transcript(entries: transcript.dropLast())
+    }
+
+    @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
+    @available(watchOS, unavailable)
+    extension SystemLanguageModel {
+        /// An error from the system language model.
+        ///
+        /// - Note: This API is exclusive to AnyLanguageModel
+        ///   and using it means your code is no longer drop-in compatible
+        ///   with the Foundation Models framework.
+        ///   Foundation Models 27 has a `SystemLanguageModel.Error` type with other cases.
+        public enum Error: LocalizedError, Sendable, Equatable {
+            /// The session uses dynamic instructions,
+            /// which the system language model supports only in apps built with Swift 6.4 or later
+            /// that run on OS 27 or later, and not on tvOS.
+            case dynamicInstructionsUnavailable
+
+            public var errorDescription: String? {
+                switch self {
+                case .dynamicInstructionsUnavailable:
+                    "Dynamic instructions require an app built with Swift 6.4 or later that runs Foundation Models on OS 27 or later, and aren't available on tvOS."
+                }
+            }
+        }
+    }
+
+    #if compiler(>=6.4) && !os(tvOS)
+        /// Dynamic instructions that resolve an AnyLanguageModel session
+        /// each time Foundation Models evaluates them.
+        @available(macOS 27.0, iOS 27.0, visionOS 27.0, watchOS 27.0, *)
+        struct FoundationModelsDynamicInstructionsAdapter: FoundationModels.DynamicInstructions {
+            let session: LanguageModelSession
+
+            var body: some FoundationModels.DynamicInstructions {
+                let requestContext = session.resolvedRequestContext()
+                if let instructions = requestContext.instructions {
+                    instructions.toFoundationModels()
+                }
+                requestContext.tools.toFoundationModels()
+            }
+        }
+
+        @available(macOS 27.0, iOS 27.0, visionOS 27.0, watchOS 27.0, *)
+        func makeFoundationModelsSession<Model: FoundationModels.LanguageModel>(
+            model: Model,
+            session: LanguageModelSession,
+            prompt: Prompt
+        ) -> FoundationModels.LanguageModelSession {
+            if session.usesDynamicInstructions {
+                // Foundation Models evaluates the dynamic instructions itself,
+                // so the history leaves out the instructions entry.
+                let history = fmTranscriptDroppingDuplicatePrompt(
+                    Transcript(
+                        entries: session.transcript.filter { entry in
+                            if case .instructions = entry { return false }
+                            return true
+                        }
+                    ),
+                    prompt: prompt
+                ).toFoundationModels(instructions: nil, toolDefinitions: [])
+                return FoundationModels.LanguageModelSession(
+                    model: model,
+                    dynamicInstructions: FoundationModelsDynamicInstructionsAdapter(session: session),
+                    history: history
+                )
+            }
+
+            let requestContext = session.resolvedRequestContext()
+            return FoundationModels.LanguageModelSession(
+                model: model,
+                tools: requestContext.tools.toFoundationModels(),
+                transcript: fmTranscriptDroppingDuplicatePrompt(
+                    requestContext.transcript,
+                    prompt: prompt
+                ).toFoundationModels(
+                    instructions: requestContext.instructions,
+                    toolDefinitions: requestContext.tools
+                        .filter(\.includesSchemaInInstructions)
+                        .map { Transcript.ToolDefinition(tool: $0) }
+                )
+            )
+        }
+    #endif
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension Prompt {
+        func toFoundationModels() throws -> FoundationModels.Prompt {
+            let prompts: [FoundationModels.Prompt] = try components.map { component in
+                switch component {
+                case .text(let text):
+                    return FoundationModels.Prompt(text.content)
+                case .image(_, let image):
+                    #if compiler(>=6.4) && !os(tvOS) && !os(watchOS)
+                        if #available(macOS 27, iOS 27, visionOS 27, *) {
+                            switch image.source {
+                            case .url(let url, let orientation):
+                                guard url.isFileURL else {
+                                    throw PromptBridgeError.nonFileImageURL
+                                }
+                                return FoundationModels.Prompt(
+                                    FoundationModels.Attachment(
+                                        imageURL: url,
+                                        orientation: orientation.flatMap(
+                                            CGImagePropertyOrientation.init(rawValue:)
+                                        )
+                                    )
+                                )
+                            case .image(let value, let orientation):
+                                return FoundationModels.Prompt(
+                                    FoundationModels.Attachment(value, orientation: orientation)
+                                )
+                            }
+                        }
+                    #endif
+                    throw PromptBridgeError.attachmentsUnavailable
+                }
+            }
+            return FoundationModels.Prompt {
+                for prompt in prompts {
+                    prompt
+                }
+            }
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension Instructions {
+        func toFoundationModels() -> FoundationModels.Instructions {
+            FoundationModels.Instructions(self.description)
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension GenerationOptions {
+        func toFoundationModels() -> FoundationModels.GenerationOptions {
+            let sampling: FoundationModels.GenerationOptions.SamplingMode?
+            switch self.sampling?.mode {
+            case .greedy:
+                sampling = .greedy
+            case .topK(let k, let seed):
+                sampling = .random(top: k, seed: seed)
+            case .nucleus(let probabilityThreshold, let seed):
+                sampling = .random(probabilityThreshold: probabilityThreshold, seed: seed)
+            case nil:
+                sampling = nil
+            }
+
+            #if compiler(>=6.4) && !os(tvOS)
+                return FoundationModels.GenerationOptions(
+                    samplingMode: sampling,
+                    temperature: temperature,
+                    maximumResponseTokens: maximumResponseTokens
+                )
+            #else
+                return FoundationModels.GenerationOptions(
+                    sampling: sampling,
+                    temperature: temperature,
+                    maximumResponseTokens: maximumResponseTokens
+                )
+            #endif
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension LanguageModelFeedback.Sentiment {
+        func toFoundationModels() -> FoundationModels.LanguageModelFeedback.Sentiment {
+            switch self {
+            case .positive: .positive
+            case .negative: .negative
+            case .neutral: .neutral
+            }
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension LanguageModelFeedback.Issue {
+        func toFoundationModels() -> FoundationModels.LanguageModelFeedback.Issue {
+            FoundationModels.LanguageModelFeedback.Issue(
+                category: self.category.toFoundationModels(),
+                explanation: self.explanation
+            )
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension LanguageModelFeedback.Issue.Category {
+        func toFoundationModels() -> FoundationModels.LanguageModelFeedback.Issue.Category {
+            switch self {
+            case .unhelpful: .unhelpful
+            case .tooVerbose: .tooVerbose
+            case .didNotFollowInstructions: .didNotFollowInstructions
+            case .incorrect: .incorrect
+            case .stereotypeOrBias: .stereotypeOrBias
+            case .suggestiveOrSexual: .suggestiveOrSexual
+            case .vulgarOrOffensive: .vulgarOrOffensive
+            case .triggeredGuardrailUnexpectedly: .triggeredGuardrailUnexpectedly
+            }
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension Array where Element == (any Tool) {
+        func toFoundationModels() -> [any FoundationModels.Tool] {
+            map { AnyToolWrapper($0) }
+        }
+    }
+
+    enum PromptBridgeError: Error, LocalizedError {
+        case attachmentsUnavailable
+        case nonFileImageURL
+
+        var errorDescription: String? {
+            switch self {
+            case .attachmentsUnavailable:
+                return
+                    "Prompt attachments require an app built with Swift 6.4 or later that runs Foundation Models on OS 27 or later, and aren't available on tvOS or watchOS."
+            case .nonFileImageURL:
+                return
+                    "Foundation Models accepts image attachment URLs only for local files. Download the image to a file URL, or attach it as a CGImage."
+            }
+        }
+    }
+
+    /// A type-erased wrapper that bridges any `Tool` to `FoundationModels.Tool`.
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    private struct AnyToolWrapper: FoundationModels.Tool {
+        typealias Arguments = FoundationModels.GeneratedContent
+        typealias Output = String
+
+        let name: String
+        let description: String
+        let parameters: FoundationModels.GenerationSchema
+        let includesSchemaInInstructions: Bool
+
+        private let wrappedTool: any Tool
+
+        init(_ tool: any Tool) {
+            self.wrappedTool = tool
+            self.name = tool.name
+            self.description = tool.description
+            self.parameters = FoundationModels.GenerationSchema(tool.parameters)
+            self.includesSchemaInInstructions = tool.includesSchemaInInstructions
+        }
+
+        func call(arguments: FoundationModels.GeneratedContent) async throws -> Output {
+            let output = try await wrappedTool.callFunction(arguments: arguments)
+            return output.promptRepresentation.description
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension FoundationModels.GenerationSchema {
+        internal init(_ content: AnyLanguageModel.GenerationSchema) {
+            let resolvedSchema = content.withResolvedRoot() ?? content
+
+            // Convert the GenerationSchema into a DynamicGenerationSchema, preserving $defs
+            let rawParameters = try? JSONValue(resolvedSchema)
+
+            if case .object(var rootObject) = rawParameters {
+                // Extract dependencies from $defs and remove from the root payload
+                let defs = rootObject.removeValue(forKey: "$defs")?.objectValue ?? [:]
+
+                // Convert root schema
+                if let rootData = try? JSONEncoder().encode(JSONValue.object(rootObject)),
+                    let rootJSONSchema = try? JSONDecoder().decode(JSONSchema.self, from: rootData)
+                {
+                    let rootDynamicSchema = convertToDynamicSchema(rootJSONSchema)
+
+                    // Convert each dependency schema
+                    let dependencies: [FoundationModels.DynamicGenerationSchema] = defs.compactMap { name, value in
+                        guard
+                            let defData = try? JSONEncoder().encode(value),
+                            let defJSONSchema = try? JSONDecoder().decode(JSONSchema.self, from: defData)
+                        else {
+                            return nil
+                        }
+                        return convertToDynamicSchema(defJSONSchema, name: name)
+                    }
+
+                    if let schema = try? FoundationModels.GenerationSchema(
+                        root: rootDynamicSchema,
+                        dependencies: dependencies
+                    ) {
+                        self = schema
+                        return
+                    }
+                }
+            }
+
+            // Fallback to a minimal string schema if conversion fails
+            self = FoundationModels.GenerationSchema(
+                type: String.self,
+                properties: []
+            )
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension FoundationModels.GeneratedContent {
+        internal init(_ content: AnyLanguageModel.GeneratedContent) throws {
+            try self.init(json: content.jsonString)
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension AnyLanguageModel.GeneratedContent {
+        internal init(_ content: FoundationModels.GeneratedContent) throws {
+            try self.init(json: content.jsonString)
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension Tool {
+        fileprivate func callFunction(arguments: FoundationModels.GeneratedContent) async throws
+            -> any PromptRepresentable
+        {
+            let content = try GeneratedContent(arguments)
+            return try await call(arguments: Self.Arguments(content))
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    func convertToDynamicSchema(
+        _ jsonSchema: JSONSchema,
+        name: String? = nil
+    ) -> FoundationModels.DynamicGenerationSchema {
+        switch jsonSchema {
+        case .object(_, _, _, _, _, _, properties: let properties, required: let required, _):
+            let schemaProperties = properties.compactMap { key, value in
+                convertToProperty(key: key, schema: value, required: required)
+            }
+            return .init(name: name ?? "", description: jsonSchema.description, properties: schemaProperties)
+
+        case .string(_, _, _, _, _, _, _, _, pattern: let pattern, _):
+            if let values = jsonSchema.enum?.compactMap(\.stringValue), !values.isEmpty {
+                if let name {
+                    return .init(name: name, description: jsonSchema.description, anyOf: values)
+                }
+            }
+
+            var guides: [FoundationModels.GenerationGuide<String>] = []
+            if let values = jsonSchema.enum?.compactMap(\.stringValue), !values.isEmpty {
+                guides.append(.anyOf(values))
+            }
+            if let value = jsonSchema.const?.stringValue {
+                guides.append(.constant(value))
+            }
+            if let pattern, let regex = try? Regex(pattern) {
+                guides.append(.pattern(regex))
+            }
+            return .init(type: String.self, guides: guides)
+
+        case .integer(_, _, _, _, _, _, minimum: let minimum, maximum: let maximum, _, _, _):
+            if let enumValues = jsonSchema.enum {
+                let enumsSchema = enumValues.compactMap { convertConstToSchema(JSONValue($0)) }
+                return .init(name: name ?? "", anyOf: enumsSchema)
+            }
+
+            var guides: [FoundationModels.GenerationGuide<Int>] = []
+            if let min = minimum {
+                guides.append(.minimum(min))
+            }
+            if let max = maximum {
+                guides.append(.maximum(max))
+            }
+            if let value = jsonSchema.const?.intValue {
+                guides.append(.range(value ... value))
+            }
+            return .init(type: Int.self, guides: guides)
+
+        case .number(_, _, _, _, _, _, minimum: let minimum, maximum: let maximum, _, _, _):
+            if let enumValues = jsonSchema.enum {
+                let enumsSchema = enumValues.compactMap { convertConstToSchema(JSONValue($0)) }
+                return .init(name: name ?? "", anyOf: enumsSchema)
+            }
+
+            var guides: [FoundationModels.GenerationGuide<Double>] = []
+            if let min = minimum {
+                guides.append(.minimum(min))
+            }
+            if let max = maximum {
+                guides.append(.maximum(max))
+            }
+            if let value = jsonSchema.const?.doubleValue {
+                guides.append(.range(value ... value))
+            }
+            return .init(type: Double.self, guides: guides)
+
+        case .boolean:
+            return .init(type: Bool.self)
+
+        case .anyOf(let schemas):
+            // Before OS 26.4, Foundation Models has no null schema.
+            // Leave out null variants there,
+            // so that the model generates another variant instead of an unconstrained string.
+            var choices = schemas
+            if !supportsNullSchema {
+                let nonNull = schemas.filter { schema in
+                    if case .null = schema { return false }
+                    return true
+                }
+                if !nonNull.isEmpty { choices = nonNull }
+            }
+            if choices.count == 1 {
+                return convertToDynamicSchema(choices[0], name: name)
+            }
+            return .init(name: name ?? "", anyOf: choices.map { convertToDynamicSchema($0) })
+
+        case .array(_, _, _, _, _, _, items: let items, minItems: let minItems, maxItems: let maxItems, _):
+            let itemsSchema =
+                items.map { convertToDynamicSchema($0) }
+                ?? FoundationModels.DynamicGenerationSchema(type: String.self)
+            return .init(arrayOf: itemsSchema, minimumElements: minItems, maximumElements: maxItems)
+
+        case .reference(let name):
+            let prefix = "#/$defs/"
+            let typeName = name.hasPrefix(prefix) ? String(name.dropFirst(prefix.count)) : name
+            return .init(referenceTo: typeName)
+
+        case .null:
+            #if compiler(>=6.3) && !os(tvOS)
+                if #available(macOS 26.4, iOS 26.4, watchOS 27.0, visionOS 26.4, *) {
+                    return .null
+                }
+            #endif
+            return .init(type: String.self)
+
+        case .allOf, .oneOf, .not, .empty, .any:
+            return .init(type: String.self)
+        }
+    }
+
+    /// Whether Foundation Models supports `DynamicGenerationSchema.null` at run time.
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    private var supportsNullSchema: Bool {
+        #if compiler(>=6.3) && !os(tvOS)
+            if #available(macOS 26.4, iOS 26.4, watchOS 27.0, visionOS 26.4, *) {
+                return true
+            }
+        #endif
+        return false
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    func convertToProperty(
+        key: String,
+        schema: JSONSchema,
+        required: [String]
+    ) -> FoundationModels.DynamicGenerationSchema.Property {
+        .init(
+            name: key,
+            description: schema.description,
+            schema: convertToDynamicSchema(schema),
+            isOptional: !required.contains(key)
+        )
+    }
+
+    /// Converts a JSON constant value to a DynamicGenerationSchema.
+    /// Only handles scalar types (int, double, string); returns nil for null, object, bool, and array.
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    func convertConstToSchema(_ value: JSONValue) -> FoundationModels.DynamicGenerationSchema? {
+        switch value {
+        case .int(let intValue):
+            .init(type: Int.self, guides: [.range(intValue ... intValue)])
+        case .double(let doubleValue):
+            .init(type: Double.self, guides: [.range(doubleValue ... doubleValue)])
+        case .string(let stringValue):
+            .init(type: String.self, guides: [.constant(stringValue)])
+        case .null, .object, .bool, .array:
+            nil
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension Transcript.Entry {
+        /// Converts the entry to a Foundation Models transcript entry.
+        func toFoundationModels() -> FoundationModels.Transcript.Entry? {
+            Transcript(entries: [self]).toFoundationModels(instructions: nil, toolDefinitions: []).first
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension Transcript {
+        func toFoundationModels(
+            instructions: AnyLanguageModel.Instructions?,
+            toolDefinitions: [Transcript.ToolDefinition]
+        ) -> FoundationModels.Transcript {
+            var fmEntries: [FoundationModels.Transcript.Entry] = []
+
+            // Add instructions entry if provided and not already in transcript
+            if let instructions = instructions {
+                let hasInstructions =
+                    self.first.map { entry in
+                        if case .instructions = entry { return true } else { return false }
+                    } ?? false
+
+                if !hasInstructions {
+                    let fmInstructions = FoundationModels.Transcript.Instructions(
+                        segments: [.text(.init(content: instructions.description))],
+                        toolDefinitions: toolDefinitions.toFoundationModels()
+                    )
+                    fmEntries.append(.instructions(fmInstructions))
+                }
+            }
+
+            // Convert each entry
+            for entry in self {
+                switch entry {
+                case .instructions(let instr):
+                    let fmSegments = instr.segments.toFoundationModels()
+                    let fmToolDefinitions = instr.toolDefinitions.toFoundationModels()
+                    let fmInstructions = FoundationModels.Transcript.Instructions(
+                        segments: fmSegments,
+                        toolDefinitions: fmToolDefinitions
+                    )
+                    fmEntries.append(.instructions(fmInstructions))
+
+                case .prompt(let prompt):
+                    let fmSegments = prompt.segments.toFoundationModels()
+                    let fmPrompt = FoundationModels.Transcript.Prompt(
+                        segments: fmSegments
+                    )
+                    fmEntries.append(.prompt(fmPrompt))
+
+                case .reasoning:
+                    // Keep display history in the transcript without sending unsupported replay state.
+                    continue
+                case .response(let response):
+                    let fmSegments = response.segments.toFoundationModels()
+                    let fmResponse = FoundationModels.Transcript.Response(
+                        assetIDs: response.assetIDs,
+                        segments: fmSegments
+                    )
+                    fmEntries.append(.response(fmResponse))
+
+                case .toolCalls(let toolCalls):
+                    let fmCalls = toolCalls.compactMap { call -> FoundationModels.Transcript.ToolCall? in
+                        guard let fmArguments = try? FoundationModels.GeneratedContent(call.arguments) else {
+                            return nil
+                        }
+                        return FoundationModels.Transcript.ToolCall(
+                            id: call.id,
+                            toolName: call.toolName,
+                            arguments: fmArguments
+                        )
+                    }
+                    let fmToolCalls = FoundationModels.Transcript.ToolCalls(id: toolCalls.id, fmCalls)
+                    fmEntries.append(.toolCalls(fmToolCalls))
+
+                case .toolOutput(let toolOutput):
+                    let fmSegments = toolOutput.segments.toFoundationModels()
+                    let fmToolOutput = FoundationModels.Transcript.ToolOutput(
+                        id: toolOutput.id,
+                        toolName: toolOutput.toolName,
+                        segments: fmSegments
+                    )
+                    fmEntries.append(.toolOutput(fmToolOutput))
+                }
+            }
+
+            return FoundationModels.Transcript(entries: fmEntries)
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension Array where Element == Transcript.Segment {
+        func toFoundationModels() -> [FoundationModels.Transcript.Segment] {
+            compactMap { segment -> FoundationModels.Transcript.Segment? in
+                switch segment {
+                case .text(let textSegment):
+                    return .text(.init(id: textSegment.id, content: textSegment.content))
+                case .structure(let structuredSegment):
+                    guard let fmContent = try? FoundationModels.GeneratedContent(structuredSegment.content) else {
+                        return nil
+                    }
+                    #if os(watchOS)
+                        return .structure(
+                            .init(
+                                id: structuredSegment.id,
+                                schemaName: structuredSegment.source,
+                                content: fmContent
+                            )
+                        )
+                    #else
+                        return .structure(
+                            .init(
+                                id: structuredSegment.id,
+                                source: structuredSegment.source,
+                                content: fmContent
+                            )
+                        )
+                    #endif
+                case .image(let imageSegment):
+                    #if compiler(>=6.4) && !os(tvOS)
+                        if #available(macOS 27.0, iOS 27.0, visionOS 27.0, watchOS 27.0, *) {
+                            guard let fmImage = FoundationModels.Transcript.ImageAttachment(imageSegment) else {
+                                return nil
+                            }
+                            return .attachment(
+                                .init(
+                                    id: imageSegment.id,
+                                    content: .image(fmImage)
+                                )
+                            )
+                        }
+                    #endif
+                    return nil
+                }
+            }
+        }
+    }
+
+    #if compiler(>=6.4) && !os(tvOS)
+        import CoreGraphics
+        import ImageIO
+
+        @available(macOS 27.0, iOS 27.0, visionOS 27.0, watchOS 27.0, *)
+        extension FoundationModels.Transcript.ImageAttachment {
+            fileprivate init?(_ imageSegment: Transcript.ImageSegment) {
+                switch imageSegment.source {
+                case .url(let url):
+                    guard url.isFileURL else { return nil }
+                    self.init(imageURL: url)
+                case .data(let data, _):
+                    guard
+                        let imageSource = CGImageSourceCreateWithData(data as CFData, nil),
+                        let cgImage = CGImageSourceCreateImageAtIndex(imageSource, 0, nil)
+                    else {
+                        return nil
+                    }
+                    let properties =
+                        CGImageSourceCopyPropertiesAtIndex(
+                            imageSource,
+                            0,
+                            nil
+                        ) as? [CFString: Any]
+                    let orientation = (properties?[kCGImagePropertyOrientation] as? NSNumber)
+                        .flatMap { CGImagePropertyOrientation(rawValue: $0.uint32Value) }
+                    self.init(cgImage, orientation: orientation)
+                }
+            }
+        }
+    #endif
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    extension Array where Element == Transcript.ToolDefinition {
+        func toFoundationModels() -> [FoundationModels.Transcript.ToolDefinition] {
+            map { toolDef in
+                FoundationModels.Transcript.ToolDefinition(
+                    name: toolDef.name,
+                    description: toolDef.description,
+                    parameters: FoundationModels.GenerationSchema(toolDef.parameters)
+                )
+            }
+        }
+    }
+
+    // MARK: - Shared FoundationModels Session Bridging
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    func fmRespond<Content>(
+        makeSession: @Sendable () async throws -> FoundationModels.LanguageModelSession,
+        fmPrompt: FoundationModels.Prompt,
+        fmOptions: FoundationModels.GenerationOptions,
+        type: Content.Type,
+        schema: GenerationSchema,
+        includeSchemaInPrompt: Bool
+    ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
+        let fmSession = try await makeSession()
+        if type == String.self {
+            let fmResponse = try await fmSession.respond(to: fmPrompt, options: fmOptions)
+            let generatedContent = GeneratedContent(fmResponse.content)
+            return LanguageModelSession.Response(
+                content: fmResponse.content as! Content,
+                rawContent: generatedContent,
+                transcriptEntries: []
+            )
+        } else {
+            // For non-String types, use schema-based generation
+            let fmSchema = FoundationModels.GenerationSchema(schema)
+            let fmResponse = try await fmSession.respond(
+                to: fmPrompt,
+                schema: fmSchema,
+                includeSchemaInPrompt: includeSchemaInPrompt,
+                options: fmOptions
+            )
+
+            func finalize(content: Content) -> LanguageModelSession.Response<Content> {
+                let normalizedRaw = content.generatedContent
+                if let jsonValue = try? JSONValue(normalizedRaw),
+                    case .array(let values) = jsonValue,
+                    values.isEmpty,
+                    let placeholder = placeholderContent(for: type, schema: schema)
+                {
+                    return LanguageModelSession.Response(
+                        content: placeholder.content,
+                        rawContent: placeholder.rawContent,
+                        transcriptEntries: []
+                    )
+                }
+                return LanguageModelSession.Response(
+                    content: content,
+                    rawContent: normalizedRaw,
+                    transcriptEntries: []
+                )
+            }
+
+            do {
+                let generatedContent = try GeneratedContent(fmResponse.content)
+                let content = try type.init(generatedContent)
+
+                return finalize(content: content)
+            } catch {
+                // Attempt partial JSON decoding before surfacing an error.
+                if let partialContent = try? GeneratedContent(json: fmResponse.content.jsonString),
+                    let content = try? type.init(partialContent)
+                {
+                    return finalize(content: content)
+                }
+                if let placeholder = placeholderContent(for: type, schema: schema) {
+                    return finalize(content: placeholder.content)
+                }
+                throw error
+            }
+        }
+    }
+
+    @available(macOS 26.0, iOS 26.0, watchOS 27.0, tvOS 26.0, visionOS 26.0, *)
+    func fmStreamResponse<Content>(
+        makeSession: @escaping @Sendable () async throws -> FoundationModels.LanguageModelSession,
+        fmPrompt: FoundationModels.Prompt,
+        fmOptions: FoundationModels.GenerationOptions,
+        type: Content.Type,
+        schema: GenerationSchema,
+        includeSchemaInPrompt: Bool
+    ) -> LanguageModelSession.ResponseStream<Content> where Content: Generable {
+        let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, Error> =
+            AsyncThrowingStream { continuation in
+
+                func accumulateText(
+                    _ chunkText: String,
+                    accumulatedText: inout String,
+                    lastLength: inout Int
+                ) {
+                    if chunkText.count >= lastLength, chunkText.hasPrefix(accumulatedText) {
+                        let startIdx = chunkText.index(chunkText.startIndex, offsetBy: lastLength)
+                        let delta = String(chunkText[startIdx...])
+                        accumulatedText += delta
+                        lastLength = chunkText.count
+                    } else if chunkText.hasPrefix(accumulatedText) {
+                        accumulatedText = chunkText
+                        lastLength = chunkText.count
+                    } else if accumulatedText.hasPrefix(chunkText) {
+                        accumulatedText = chunkText
+                        lastLength = chunkText.count
+                    } else {
+                        accumulatedText += chunkText
+                        lastLength = accumulatedText.count
+                    }
+                }
+
+                func processStringStream(_ fmSession: FoundationModels.LanguageModelSession) async {
+                    let fmStream: FoundationModels.LanguageModelSession.ResponseStream<String> =
+                        fmSession.streamResponse(to: fmPrompt, options: fmOptions)
+
+                    var accumulatedText = ""
+                    do {
+                        var lastLength = 0
+                        for try await snapshot in fmStream {
+                            var chunkText: String = snapshot.content
+
+                            // Handle "null" from FoundationModels as first temp result
+                            if chunkText == "null" && accumulatedText == "" {
+                                chunkText = ""
+                            }
+
+                            accumulateText(
+                                chunkText,
+                                accumulatedText: &accumulatedText,
+                                lastLength: &lastLength
+                            )
+
+                            let raw = GeneratedContent(accumulatedText)
+                            let snapshotContent = (accumulatedText as! Content).asPartiallyGenerated()
+                            continuation.yield(.init(content: snapshotContent, rawContent: raw))
+                        }
+                        continuation.finish()
+                    } catch {
+                        continuation.finish(throwing: error)
+                    }
+                }
+
+                func processStructuredStream(_ fmSession: FoundationModels.LanguageModelSession) async {
+                    let fmSchema = FoundationModels.GenerationSchema(schema)
+                    let fmStream = fmSession.streamResponse(
+                        to: fmPrompt,
+                        schema: fmSchema,
+                        includeSchemaInPrompt: includeSchemaInPrompt,
+                        options: fmOptions
+                    )
+
+                    func processTextFallback() async {
+                        let fmTextStream: FoundationModels.LanguageModelSession.ResponseStream<String> =
+                            fmSession.streamResponse(to: fmPrompt, options: fmOptions)
+
+                        var accumulatedText = ""
+                        var didYield = false
+                        do {
+                            var lastLength = 0
+                            for try await snapshot in fmTextStream {
+                                var chunkText: String = snapshot.content
+                                if chunkText == "null" && accumulatedText.isEmpty {
+                                    chunkText = ""
+                                }
+
+                                accumulateText(
+                                    chunkText,
+                                    accumulatedText: &accumulatedText,
+                                    lastLength: &lastLength
+                                )
+
+                                if let partialContent = try? GeneratedContent(json: accumulatedText) {
+                                    let partial: Content.PartiallyGenerated? = try? .init(partialContent)
+                                    if let partial {
+                                        continuation.yield(.init(content: partial, rawContent: partialContent))
+                                        didYield = true
+                                    }
+                                }
+                            }
+                            if !didYield, let placeholder = placeholderPartialContent(for: type, schema: schema) {
+                                continuation.yield(
+                                    .init(content: placeholder.content, rawContent: placeholder.rawContent)
+                                )
+                            }
+                            continuation.finish()
+                        } catch {
+                            if !didYield, let placeholder = placeholderPartialContent(for: type, schema: schema) {
+                                continuation.yield(
+                                    .init(content: placeholder.content, rawContent: placeholder.rawContent)
+                                )
+                            }
+                            continuation.finish(throwing: error)
+                        }
+                    }
+
+                    var didYield = false
+                    do {
+                        for try await snapshot in fmStream {
+                            let jsonString = snapshot.content.jsonString
+                            let raw =
+                                (try? GeneratedContent(snapshot.content))
+                                ?? (try? GeneratedContent(json: jsonString))
+                                ?? GeneratedContent(jsonString)
+
+                            // Prefer partial decoding so we can surface intermediate snapshots.
+                            if let partialContent = try? GeneratedContent(json: jsonString) {
+                                let partial: Content.PartiallyGenerated? = try? .init(partialContent)
+                                if let partial {
+                                    continuation.yield(.init(content: partial, rawContent: partialContent))
+                                    didYield = true
+                                    continue
+                                }
+                            }
+
+                            // Fallback to full conversion when partial decoding isn't possible.
+                            if let value = try? type.init(raw) {
+                                let snapshotContent = value.asPartiallyGenerated()
+                                continuation.yield(.init(content: snapshotContent, rawContent: raw))
+                                didYield = true
+                            }
+                        }
+                        if !didYield, let placeholder = placeholderPartialContent(for: type, schema: schema) {
+                            continuation.yield(
+                                .init(content: placeholder.content, rawContent: placeholder.rawContent)
+                            )
+                        }
+                        continuation.finish()
+                    } catch {
+                        if didYield {
+                            continuation.finish(throwing: error)
+                        } else {
+                            await processTextFallback()
+                        }
+                    }
+                }
+
+                let streamingTask: _Concurrency.Task<Void, Never> = _Concurrency.Task(priority: nil) {
+                    let fmSession: FoundationModels.LanguageModelSession
+                    do {
+                        fmSession = try await makeSession()
+                    } catch {
+                        continuation.finish(throwing: error)
+                        return
+                    }
+                    if type == String.self {
+                        await processStringStream(fmSession)
+                    } else {
+                        await processStructuredStream(fmSession)
+                    }
+                }
+                continuation.onTermination = { _ in streamingTask.cancel() }
+            }
+
+        return LanguageModelSession.ResponseStream(stream: stream)
+    }
+
+    // MARK: - Placeholder Helpers
+
+    /// Generates minimal partial content when structured output is missing or invalid.
+    private func placeholderPartialContent<Content: Generable>(
+        for type: Content.Type,
+        schema: GenerationSchema
+    ) -> (content: Content.PartiallyGenerated, rawContent: GeneratedContent)? {
+        let resolved = schema.withResolvedRoot() ?? schema
+        let raw = placeholderGeneratedContent(from: resolved.root, defs: resolved.defs)
+
+        if let partial: Content.PartiallyGenerated = try? .init(raw) {
+            return (partial, raw)
+        }
+        if let value = try? Content(raw) {
+            return (value.asPartiallyGenerated(), raw)
+        }
+        return nil
+    }
+
+    /// Generates minimal full content when structured output is missing or invalid.
+    private func placeholderContent<Content: Generable>(
+        for type: Content.Type,
+        schema: GenerationSchema
+    ) -> (content: Content, rawContent: GeneratedContent)? {
+        let resolved = schema.withResolvedRoot() ?? schema
+        let raw = placeholderGeneratedContent(from: resolved.root, defs: resolved.defs)
+
+        if let value = try? Content(raw) {
+            return (value, raw)
+        }
+        return nil
+    }
+
+    /// Builds a minimal generated content tree from a schema node.
+    private func placeholderGeneratedContent(
+        from node: GenerationSchema.Node,
+        defs: [String: GenerationSchema.Node]
+    ) -> GeneratedContent {
+        switch node {
+        case .object(let obj):
+            var properties: Array<(String, GeneratedContent)> = []
+            for (key, value) in obj.properties {
+                let generated = placeholderGeneratedContent(from: value, defs: defs)
+                properties.append((key, generated))
+            }
+            let convertible: [(String, any ConvertibleToGeneratedContent)] = properties.map {
+                ($0.0, $0.1 as any ConvertibleToGeneratedContent)
+            }
+            return GeneratedContent(
+                properties: convertible,
+                id: nil,
+                uniquingKeysWith: { first, _ in first }
+            )
+
+        case .array(let arr):
+            let item = placeholderGeneratedContent(from: arr.items, defs: defs)
+            let count = max(arr.minItems ?? 1, 1)
+            let elements = Array(repeating: item, count: count)
+            return GeneratedContent(elements: elements)
+
+        case .string(let str):
+            if let first = str.enumChoices?.first {
+                return GeneratedContent(first)
+            }
+            return GeneratedContent("placeholder")
+
+        case .number(let num):
+            if num.integerOnly {
+                return GeneratedContent(Int(num.minimum ?? 0))
+            } else {
+                return GeneratedContent(num.minimum ?? 0)
+            }
+
+        case .boolean:
+            return GeneratedContent(true)
+
+        case .null:
+            return GeneratedContent(kind: .null)
+
+        case .anyOf(let nodes):
+            if let first = nodes.first {
+                return placeholderGeneratedContent(from: first, defs: defs)
+            }
+            return GeneratedContent("placeholder")
+
+        case .ref(let name):
+            if let node = defs[name] {
+                return placeholderGeneratedContent(from: node, defs: defs)
+            }
+            return GeneratedContent("placeholder")
+        }
+    }
+#endif

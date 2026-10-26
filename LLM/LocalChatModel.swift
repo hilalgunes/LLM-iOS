@@ -1,4 +1,6 @@
 import Foundation
+import AnyLanguageModel
+import MLXFoundationModels
 import HuggingFace
 import MLX
 import MLXHuggingFace
@@ -10,6 +12,7 @@ import AVFoundation
 import Speech
 
 enum LocalModelChoice: String, CaseIterable, Identifiable {
+    case apple
     case qwen
     case gemma
     case gemma4
@@ -21,6 +24,8 @@ enum LocalModelChoice: String, CaseIterable, Identifiable {
 
     var repositoryID: String {
         switch self {
+        case .apple:
+            "apple-system"
         case .qwen:
             "mlx-community/Qwen3-0.6B-4bit"
         case .gemma:
@@ -34,6 +39,8 @@ enum LocalModelChoice: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .apple:
+            "Apple Intelligence · Sistem modeli"
         case .qwen:
             "Qwen 3 · 0.6B"
         case .gemma:
@@ -47,6 +54,8 @@ enum LocalModelChoice: String, CaseIterable, Identifiable {
 
     var shortTitle: String {
         switch self {
+        case .apple:
+            "Apple Intelligence"
         case .qwen:
             "Qwen 3"
         case .gemma:
@@ -70,7 +79,7 @@ enum LocalModelChoice: String, CaseIterable, Identifiable {
                 id: repositoryID,
                 extraEOSTokens: ["<|im_end|>"]
             )
-        case .qwen, .gemma:
+        case .apple, .qwen, .gemma:
             ModelConfiguration(id: repositoryID)
         }
     }
@@ -115,7 +124,9 @@ final class LocalChatModel {
 
     private var loadedModelID: String?
     private var modelContainer: ModelContainer?
-    private var session: ChatSession?
+    private var session: AnyLanguageModel.LanguageModelSession?
+    private var nativeModel: MLXFoundationModels.MLXLanguageModel?
+    private var pendingEviction: Task<Void, Never>?
     private weak var historyStore: ConversationHistoryStore?
     private var activeThreadID: UUID?
 
@@ -189,13 +200,21 @@ final class LocalChatModel {
     func unloadModel() {
         guard !isBusy else { return }
         session = nil
+        let previousEviction = pendingEviction
+        let modelToEvict = nativeModel
+        nativeModel = nil
+        pendingEviction = Task {
+            await previousEviction?.value
+            await modelToEvict?.evict()
+        }
         modelContainer = nil
         loadedModelID = nil
         downloadProgress = 0
     }
 
-    func releaseModelForSpeech() {
+    func releaseModelForSpeech() async {
         unloadModel()
+        await pendingEviction?.value
         Memory.clearCache()
     }
 
@@ -204,8 +223,10 @@ final class LocalChatModel {
         errorMessage = nil
 
         #if targetEnvironment(simulator)
-        errorMessage = LocalChatError.simulatorNotSupported.localizedDescription
-        return nil
+        if selectedModel != .apple {
+            errorMessage = LocalChatError.simulatorNotSupported.localizedDescription
+            return nil
+        }
         #endif
 
         let startedAt = ProcessInfo.processInfo.systemUptime
@@ -266,7 +287,7 @@ final class LocalChatModel {
         errorMessage = nil
 
         #if targetEnvironment(simulator)
-        throw LocalChatError.simulatorNotSupported
+        if selectedModel != .apple { throw LocalChatError.simulatorNotSupported }
         #endif
 
         let requestStartedAt = startedAt ?? ProcessInfo.processInfo.systemUptime
@@ -307,7 +328,22 @@ final class LocalChatModel {
     }
 
     private func prepareSession(startFreshSession: Bool = false) async throws {
+        await pendingEviction?.value
+        if selectedModel == .apple {
+            if modelContainer != nil { unloadModel(); await pendingEviction?.value }
+            let model = AnyLanguageModel.SystemLanguageModel.default
+            guard model.isAvailable else { throw LocalChatError.systemModelUnavailable }
+            if startFreshSession || session == nil {
+                session = AnyLanguageModel.LanguageModelSession(
+                    model: model,
+                    instructions: "Türkçe konuşan, açık ve yardımcı bir asistansın."
+                )
+            }
+            return
+        }
         if loadedModelID != selectedModel.id {
+            unloadModel()
+            await pendingEviction?.value
             isLoadingModel = true
             downloadProgress = 0
 
@@ -332,15 +368,24 @@ final class LocalChatModel {
             guard let modelContainer else {
                 throw LocalChatError.sessionUnavailable
             }
-            let isLargeModel = selectedModel == .gemma4
-            session = ChatSession(
-                modelContainer,
-                instructions: "Türkçe konuşan, açık ve yardımcı bir asistansın.",
-                generateParameters: GenerateParameters(
-                    maxTokens: isLargeModel ? 256 : 384,
-                    maxKVSize: isLargeModel ? 512 : 1024,
-                    temperature: 0.6
-                )
+            let model = MLXFoundationModels.MLXLanguageModel(
+                configuration: selectedModel.configuration,
+                capabilities: [],
+                weightsLocation: { id in
+                    let cache = HubCache.default
+                    guard let repo = Repo.ID(rawValue: id) else { return cache.cacheDirectory }
+                    if let commit = cache.resolveRevision(repo: repo, kind: .model, ref: "main"),
+                       let snapshot = try? cache.snapshotPath(repo: repo, kind: .model, commitHash: commit) {
+                        return snapshot
+                    }
+                    return cache.repoDirectory(repo: repo, kind: .model)
+                },
+                load: { _, _ in modelContainer }
+            )
+            nativeModel = model
+            session = AnyLanguageModel.LanguageModelSession(
+                model: AnyLanguageModel.FoundationLanguageModel(model),
+                instructions: "Türkçe konuşan, açık ve yardımcı bir asistansın."
             )
         }
         isLoadingModel = false
@@ -404,9 +449,18 @@ final class LocalChatModel {
 
         isGenerating = true
         var response = ""
-        for try await token in session.streamResponse(to: prompt) {
-            response += token
-            onToken(token)
+        let options = AnyLanguageModel.GenerationOptions(
+            temperature: 0.6,
+            maximumResponseTokens: selectedModel == .gemma4 ? 256 : 384
+        )
+        for try await snapshot in session.streamResponse(to: prompt, options: options) {
+            let updated = snapshot.content
+            // Session streams cumulative snapshots; the UI and TTS receive only new text.
+            if updated.hasPrefix(response) {
+                let delta = String(updated.dropFirst(response.count))
+                if !delta.isEmpty { onToken(delta) }
+            }
+            response = updated
         }
         guard !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw LocalChatError.emptyResponse
@@ -420,6 +474,7 @@ enum LocalChatError: LocalizedError {
     case sessionUnavailable
     case emptyResponse
     case modelBusy
+    case systemModelUnavailable
 
     var errorDescription: String? {
         switch self {
@@ -429,6 +484,8 @@ enum LocalChatError: LocalizedError {
             "Model oturumu başlatılamadı. Lütfen tekrar deneyin."
         case .emptyResponse:
             "Model boş bir yanıt üretti. Lütfen sorunuzu yeniden deneyin."
+        case .systemModelUnavailable:
+            "Apple Intelligence sistem modeli bu cihazda kullanılamıyor. Ayarlar’dan Apple Intelligence durumunu kontrol edin veya bir MLX modeli seçin."
         case .modelBusy:
             "Model şu anda başka bir yanıt hazırlıyor. Lütfen bekleyin."
         }

@@ -1,0 +1,128 @@
+// swift-tools-version: 6.3
+// The swift-tools-version declares the minimum version of Swift required to build this package.
+
+import CompilerPluginSupport
+import PackageDescription
+
+let package = Package(
+    name: "AnyLanguageModel",
+    platforms: [
+        .macOS(.v14),
+        .macCatalyst(.v17),
+        .iOS(.v17),
+        .tvOS(.v17),
+        .watchOS(.v10),
+        .visionOS(.v1),
+    ],
+
+    products: [
+        .library(
+            name: "AnyLanguageModel",
+            targets: ["AnyLanguageModel"]
+        )
+    ],
+    traits: [
+        .trait(name: "CoreML"),
+        .trait(name: "MLX"),
+        .trait(name: "Llama"),
+        .trait(name: "AsyncHTTPClient"),
+        .default(enabledTraits: []),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/huggingface/swift-transformers", from: "1.0.0"),
+        .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.8.1"),
+        .package(
+            url: "https://github.com/mattt/EventSource",
+            from: "1.3.0",
+            traits: [
+                .defaults,
+                .trait(name: "AsyncHTTPClient", condition: .when(traits: ["AsyncHTTPClient"])),
+            ]
+        ),
+        .package(url: "https://github.com/mattt/JSONSchema", from: "1.3.0"),
+        .package(url: "https://github.com/mattt/llama.swift", .upToNextMajor(from: "2.10549.0")),
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", .upToNextMinor(from: "3.32.3")),
+        .package(url: "https://github.com/swiftlang/swift-syntax", from: "602.0.0"),
+        .package(url: "https://github.com/swift-server/async-http-client.git", from: "1.24.0"),
+    ],
+    targets: [
+        .target(
+            name: "AnyLanguageModel",
+            dependencies: [
+                .target(name: "AnyLanguageModelMacros"),
+                .product(name: "EventSource", package: "EventSource"),
+                .product(name: "JSONSchema", package: "JSONSchema"),
+                .product(
+                    name: "MLXLLM",
+                    package: "mlx-swift-lm",
+                    condition: .when(traits: ["MLX"])
+                ),
+                .product(
+                    name: "MLXVLM",
+                    package: "mlx-swift-lm",
+                    condition: .when(traits: ["MLX"])
+                ),
+                .product(
+                    name: "MLXLMCommon",
+                    package: "mlx-swift-lm",
+                    condition: .when(traits: ["MLX"])
+                ),
+                .product(
+                    name: "MLXHuggingFace",
+                    package: "mlx-swift-lm",
+                    condition: .when(traits: ["MLX"])
+                ),
+                .product(
+                    name: "HuggingFace",
+                    package: "swift-huggingface",
+                    condition: .when(traits: ["MLX"])
+                ),
+                .product(
+                    name: "Tokenizers",
+                    package: "swift-transformers",
+                    condition: .when(traits: ["MLX"])
+                ),
+                .product(
+                    name: "Transformers",
+                    package: "swift-transformers",
+                    condition: .when(traits: ["CoreML"])
+                ),
+                .product(
+                    name: "LlamaSwift",
+                    package: "llama.swift",
+                    condition: .when(traits: ["Llama"])
+                ),
+                .product(
+                    name: "AsyncHTTPClient",
+                    package: "async-http-client",
+                    condition: .when(traits: ["AsyncHTTPClient"])
+                ),
+            ]
+        ),
+        .macro(
+            name: "AnyLanguageModelMacros",
+            dependencies: [
+                .product(name: "SwiftCompilerPlugin", package: "swift-syntax"),
+                .product(name: "SwiftSyntax", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxBuilder", package: "swift-syntax"),
+                .product(name: "SwiftSyntaxMacros", package: "swift-syntax"),
+            ]
+        ),
+        .testTarget(
+            name: "AnyLanguageModelTests",
+            dependencies: [
+                "AnyLanguageModel",
+                .product(
+                    name: "MLXLMCommon",
+                    package: "mlx-swift-lm",
+                    condition: .when(traits: ["MLX"])
+                ),
+                .product(
+                    name: "AsyncHTTPClient",
+                    package: "async-http-client",
+                    condition: .when(traits: ["AsyncHTTPClient"])
+                ),
+            ],
+        ),
+    ]
+)

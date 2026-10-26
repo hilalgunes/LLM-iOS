@@ -1,0 +1,1133 @@
+import Foundation
+
+// MARK: - Token Backend
+
+/// A token-level backend used by ``ConstrainedJSONGenerator``.
+///
+/// Implementations provide tokenization, sampling, and decoding state so the
+/// generator can constrain output to valid JSON for a schema.
+protocol TokenBackend {
+    func tokenize(_ text: String) throws -> [Int]
+    func tokenText(_ token: Int) -> String?
+    func isSpecialToken(_ token: Int) -> Bool
+    mutating func decode(_ token: Int) async throws
+    mutating func sample(from allowedTokens: Set<Int>) async throws -> Int
+
+    var eosToken: Int { get }
+    var endTokens: Set<Int> { get }
+    var vocabSize: Int { get }
+    var remainingTokens: Int { get set }
+    var totalTokenBudget: Int { get }
+}
+
+/// Last-resort token-budget floor for optional structure (object keys / array items).
+///
+/// Optional *selection* is model-driven (see ``ConstrainedJSONGenerator``).
+/// This floor only kicks in when generation is about to run out of tokens: once the
+/// schema-valid minimum has been emitted (all required keys, or `minItems` elements),
+/// the generator stops offering further optionals and closes rather than risking a
+/// hard budget failure mid-value.
+private enum OptionalStructureBudget {
+    /// Minimum absolute number of tokens that should remain before offering more
+    /// optional properties or array elements.
+    static let minimumRemainingTokens = 8
+
+    /// Require at least this fraction of the total budget (divisor form).
+    static let minimumBudgetDivisor = 10
+
+    static func minimumBudget(totalTokenBudget: Int) -> Int {
+        let proportionalBudget = totalTokenBudget / minimumBudgetDivisor
+        return max(minimumRemainingTokens, proportionalBudget)
+    }
+}
+
+/// Vocabulary-derived content tokens, independent of generation-specific terminators.
+struct StructuredGenerationTokenSets: Sendable {
+    let stringContent: Set<Int>
+    let integerContent: Set<Int>
+    let decimalContent: Set<Int>
+
+    /// Classifies all content types in one synchronous vocabulary pass.
+    init<Backend: TokenBackend>(backend: Backend) {
+        let allowedWhitespace: Set<Character> = [" ", "\t", "\n"]
+        var strings = Set<Int>()
+        var integers = Set<Int>()
+        var decimals = Set<Int>()
+        strings.reserveCapacity(backend.vocabSize / 4)
+
+        for token in 0 ..< backend.vocabSize {
+            if backend.isSpecialToken(token) { continue }
+            guard let text = backend.tokenText(token), !text.isEmpty else { continue }
+
+            if text.allSatisfy({ $0.isValidJSONStringCharacter }) {
+                if !text.allSatisfy({ $0.isWhitespace })
+                    || (text.count == 1 && text.first.map { allowedWhitespace.contains($0) } == true)
+                {
+                    strings.insert(token)
+                }
+            }
+
+            let hasDigit = text.contains { Self.isASCIIDigit($0) }
+            // Standalone signs and decimal points are needed by split numeric encodings.
+            if text.allSatisfy({ Self.isASCIIDigit($0) || $0 == "-" }),
+                hasDigit || text == "-"
+            {
+                integers.insert(token)
+            }
+            if text.allSatisfy({ Self.isASCIIDigit($0) || $0 == "-" || $0 == "." }),
+                hasDigit || text == "-" || text == "."
+            {
+                decimals.insert(token)
+            }
+        }
+
+        self.stringContent = strings
+        self.integerContent = integers
+        self.decimalContent = decimals
+    }
+
+    /// JSON numbers accept ASCII digits only, not other Unicode number characters.
+    private static func isASCIIDigit(_ character: Character) -> Bool {
+        character >= "0" && character <= "9"
+    }
+}
+
+/// Owned by one loaded tokenizer with immutable token text and special-token classification.
+/// Replacing the tokenizer or special-token registry requires a new cache; changing only
+/// end tokens does not. Vocabulary size indexes valid token-ID ranges, not tokenizer identity.
+final class StructuredGenerationTokenCache: Sendable {
+    private let tokensByVocabSize = Locked<[Int: StructuredGenerationTokenSets]>([:])
+
+    func tokens<Backend: TokenBackend>(for backend: Backend) -> StructuredGenerationTokenSets {
+        tokensByVocabSize.withLock { entries in
+            if let tokens = entries[backend.vocabSize] {
+                return tokens
+            }
+            // Hold this owner's lock through construction and publication so concurrent
+            // first use performs one scan. Classification does no inference or async work
+            // and must not recursively access this cache. No backend is retained.
+            let tokens = StructuredGenerationTokenSets(backend: backend)
+            entries[backend.vocabSize] = tokens
+            return tokens
+        }
+    }
+}
+
+// MARK: - JSON Generator
+
+/// Generates JSON that conforms to a schema using constrained token sampling.
+struct ConstrainedJSONGenerator<Backend: TokenBackend> {
+    /// Minimum per-string token allocation to ensure small budgets still yield content.
+    private static var freeStringMinTokenLimit: Int { 16 }
+    /// Divisor used to compute the per-string share of the total token budget.
+    private static var freeStringTokenBudgetDivisor: Int { 16 }
+
+    /// Upper bounds for numeric token generation heuristics.
+    private static var maxIntegerTokenLimit: Int { 20 }
+    private static var maxDecimalTokenLimit: Int { 32 }
+
+    /// Includes sampled content and forced syntax decoded through the backend.
+    var generatedTokenCount: Int { backend.totalTokenBudget - backend.remainingTokens }
+
+    private var backend: Backend
+    private let schema: GenerationSchema
+    private var emittedText = ""
+    private let quoteToken: Int
+
+    private let stringTerminators: Set<Int>
+    private let stringInitialAllowedTokens: Set<Int>
+    private let stringContinuationAllowedTokens: Set<Int>
+
+    private let basicTerminators: Set<Int>
+    private let integerTerminators: Set<Int>
+    private let doubleTerminators: Set<Int>
+
+    /// Creates a constrained JSON generator.
+    ///
+    /// - Parameters:
+    ///   - backend: A backend that provides tokenization and sampling.
+    ///   - schema: The generation schema to satisfy.
+    ///   - tokenCache: The loaded tokenizer's cache, or nil to classify fresh token sets.
+    /// - Throws: ``ConstrainedGenerationError`` when required tokens cannot be tokenized.
+    init(
+        backend: Backend,
+        schema: GenerationSchema,
+        tokenCache: StructuredGenerationTokenCache? = nil
+    ) throws {
+        self.backend = backend
+        self.schema = schema
+
+        let quoteToken = try Self.singleToken(for: "\"", backend: backend)
+        self.quoteToken = quoteToken
+
+        self.stringTerminators = backend.endTokens.union([quoteToken])
+
+        var structuralTerminators = Set<Int>()
+        for structuralText in [",", "}", "]", ":"] {
+            let token = try Self.singleToken(for: structuralText, backend: backend)
+            structuralTerminators.insert(token)
+        }
+        let tokens = tokenCache?.tokens(for: backend) ?? StructuredGenerationTokenSets(backend: backend)
+        self.basicTerminators = structuralTerminators
+        self.integerTerminators = tokens.integerContent.union(structuralTerminators)
+        self.doubleTerminators = tokens.decimalContent.union(structuralTerminators)
+
+        let stringContentTokens = tokens.stringContent.subtracting(backend.endTokens)
+        self.stringInitialAllowedTokens = stringContentTokens
+        self.stringContinuationAllowedTokens = stringContentTokens.union(stringTerminators)
+    }
+
+    /// Generates a JSON string that conforms to the schema.
+    ///
+    /// - Returns: A JSON string that satisfies the schema. If the backend emits
+    ///   an end token early, the partial output is returned.
+    /// - Throws: ``ConstrainedGenerationError`` if generation fails.
+    mutating func generate() async throws -> String {
+        do {
+            return try await generateNode(schema.root)
+        } catch let error as ConstrainedGenerationError {
+            if case .earlyTermination(let partial) = error {
+                return partial
+            }
+            throw error
+        }
+    }
+
+    private static func singleToken(for text: String, backend: Backend) throws -> Int {
+        let tokens = try backend.tokenize(text)
+        guard tokens.count == 1, let token = tokens.first else {
+            throw ConstrainedGenerationError.unsupportedTokenizer("Expected single-token encoding for '\(text)'")
+        }
+        return token
+    }
+
+    private mutating func emit(_ text: String) async throws -> String {
+        for token in try backend.tokenize(text) {
+            guard backend.remainingTokens > 0 else {
+                throw ConstrainedGenerationError.tokenBudgetExceeded
+            }
+            try await backend.decode(token)
+        }
+        emittedText += text
+        return text
+    }
+
+    private func maxFreeStringTokens() -> Int {
+        let perStringLimit = max(
+            Self.freeStringMinTokenLimit,
+            backend.totalTokenBudget / Self.freeStringTokenBudgetDivisor
+        )
+        let remainingAfterClosingQuote = max(0, backend.remainingTokens - 1)
+        return min(remainingAfterClosingQuote, perStringLimit)
+    }
+
+    private mutating func generateFreeString(maxTokens: Int) async throws -> String {
+        var result = ""
+        var generated = 0
+
+        while backend.remainingTokens > 0, generated < maxTokens {
+            let allowed = result.isEmpty ? stringInitialAllowedTokens : stringContinuationAllowedTokens
+            let token = try await backend.sample(from: allowed)
+            if backend.endTokens.contains(token) {
+                throw ConstrainedGenerationError.earlyTermination(emittedText)
+            }
+            if token == quoteToken { break }
+
+            let text = backend.tokenText(token) ?? ""
+            result += text
+            emittedText += text
+            generated += 1
+            try await backend.decode(token)
+        }
+
+        return result
+    }
+
+    private mutating func generateChoice(_ candidates: [String]) async throws -> String {
+        try await generateIndexedChoice(candidates).text
+    }
+
+    /// Generates one of `candidates`.
+    ///
+    /// - Returns: The text the sampled tokens decode to, and the position in `candidates` of
+    ///   the choice they spell, or `nil` when the budget runs out before one is complete.
+    ///   The text can differ from the choice when a token's text differs from the text it
+    ///   was tokenized from, like a piece with a leading space; the position doesn't.
+    private mutating func generateIndexedChoice(
+        _ candidates: [String]
+    ) async throws -> (text: String, index: Int?) {
+        guard !candidates.isEmpty else {
+            throw ConstrainedGenerationError.tokenizationFailed
+        }
+
+        let tokenized = try candidates.map { try backend.tokenize($0) }
+        for (candidate, tokens) in zip(candidates, tokenized) {
+            if candidate.isEmpty { continue }
+            if tokens.isEmpty {
+                throw ConstrainedGenerationError.tokenizationFailed
+            }
+        }
+
+        let hasEmptyCandidate = candidates.contains("")
+        let hasPrefixCollision = Self.hasPrefixCollision(tokenized: tokenized)
+        if hasEmptyCandidate || hasPrefixCollision {
+            let chosen = deterministicChoice(from: candidates)
+            if !chosen.isEmpty {
+                _ = try await emit(chosen)
+            }
+            return (chosen, candidates.firstIndex(of: chosen))
+        }
+
+        var prefixes = Array(tokenized.indices)
+        var emitted = ""
+        var position = 0
+
+        while backend.remainingTokens > 0 {
+            if prefixes.contains(where: { tokenized[$0].count == position }) { break }
+
+            let allowed = Set(
+                prefixes.compactMap { index -> Int? in
+                    guard position < tokenized[index].count else { return nil }
+                    return tokenized[index][position]
+                }
+            )
+
+            let token = try await backend.sample(from: allowed)
+            if backend.endTokens.contains(token) {
+                throw ConstrainedGenerationError.earlyTermination(emittedText)
+            }
+            let text = backend.tokenText(token) ?? ""
+            emitted += text
+            emittedText += text
+            try await backend.decode(token)
+
+            prefixes = prefixes.filter { tokenized[$0].count > position && tokenized[$0][position] == token }
+            position += 1
+            if prefixes.isEmpty { break }
+        }
+
+        return (emitted, prefixes.first { tokenized[$0].count == position })
+    }
+
+    private func maxNumberTokens(for node: GenerationSchema.NumberNode) -> Int {
+        var limit =
+            node.integerOnly
+            ? Self.maxIntegerTokenLimit
+            : Self.maxDecimalTokenLimit
+
+        if node.integerOnly, let minimum = node.minimum, let maximum = node.maximum {
+            let maxAbs = max(abs(minimum), abs(maximum))
+            if maxAbs.isFinite, maxAbs <= Double(Int64.max) {
+                let digits = max(1, String(Int64(maxAbs.rounded(.down))).count)
+                limit = max(limit, digits + 1)
+            }
+        }
+
+        return min(backend.remainingTokens, limit)
+    }
+
+    private mutating func generateNumber(_ node: GenerationSchema.NumberNode) async throws -> String {
+        let allowedTokens = node.integerOnly ? integerTerminators : doubleTerminators
+        let numericTokens = allowedTokens.subtracting(basicTerminators)
+        var result = ""
+        let maxTokens = maxNumberTokens(for: node)
+        var generatedTokens = 0
+
+        while backend.remainingTokens > 0, generatedTokens < maxTokens {
+            let candidates = result.isEmpty ? numericTokens : allowedTokens
+            guard !candidates.isEmpty else {
+                throw ConstrainedGenerationError.tokenizationFailed
+            }
+            let token = try await backend.sample(from: candidates)
+            if backend.endTokens.contains(token) {
+                throw ConstrainedGenerationError.earlyTermination(emittedText)
+            }
+            if basicTerminators.contains(token) { break }
+
+            guard let text = backend.tokenText(token) else { break }
+            result += text
+            emittedText += text
+            generatedTokens += 1
+            try await backend.decode(token)
+        }
+
+        guard !result.isEmpty else {
+            throw ConstrainedGenerationError.numberOutOfRange("Missing number value")
+        }
+        return try validateNumberString(result, node: node)
+    }
+
+    private func validateNumberString(_ text: String, node: GenerationSchema.NumberNode) throws -> String {
+        if node.integerOnly {
+            guard let value = Int(text) else {
+                throw ConstrainedGenerationError.numberOutOfRange("Invalid integer: \(text)")
+            }
+            if let minimum = node.minimum, Double(value) < minimum {
+                throw ConstrainedGenerationError.numberOutOfRange("Integer \(value) is below minimum \(minimum)")
+            }
+            if let maximum = node.maximum, Double(value) > maximum {
+                throw ConstrainedGenerationError.numberOutOfRange("Integer \(value) exceeds maximum \(maximum)")
+            }
+            return text
+        } else {
+            guard let value = Double(text), !value.isNaN, value.isFinite else {
+                throw ConstrainedGenerationError.numberOutOfRange("Invalid number: \(text)")
+            }
+            if let minimum = node.minimum, value < minimum {
+                throw ConstrainedGenerationError.numberOutOfRange("Number \(value) is below minimum \(minimum)")
+            }
+            if let maximum = node.maximum, value > maximum {
+                throw ConstrainedGenerationError.numberOutOfRange("Number \(value) exceeds maximum \(maximum)")
+            }
+            return text
+        }
+    }
+
+    private mutating func generateNode(_ node: GenerationSchema.Node) async throws -> String {
+        guard backend.remainingTokens > 0 else {
+            throw ConstrainedGenerationError.tokenBudgetExceeded
+        }
+
+        switch node {
+        case .object(let objectNode):
+            return try await generateObject(objectNode)
+        case .array(let arrayNode):
+            return try await generateArray(arrayNode)
+        case .string(let stringNode):
+            return try await generateString(stringNode)
+        case .number(let numberNode):
+            return try await generateNumber(numberNode)
+        case .boolean:
+            return try await generateChoice(["true", "false"])
+        case .null:
+            return try await emit("null")
+        case .ref(let typeName):
+            guard let referenced = schema.defs[typeName] else {
+                throw ConstrainedGenerationError.missingReference(typeName)
+            }
+            return try await generateNode(referenced)
+        case .anyOf(let variants):
+            guard !variants.isEmpty else {
+                throw ConstrainedGenerationError.emptyAnyOf
+            }
+            return try await generateAnyOf(variants)
+        }
+    }
+
+    /// Lets the model choose a variant of an `anyOf`.
+    ///
+    /// Samples once, without decoding, among the tokens that can start each variant and
+    /// continues with the variants that can start with the sample, as
+    /// ``sampleWhetherToCloseEmptyArray(items:)`` does for an array's first item.
+    /// Object variants all start with `{`, so the keys the model emits tell them apart.
+    /// Other variants that start alike, like two strings, fall back to the first of them.
+    private mutating func generateAnyOf(_ variants: [GenerationSchema.Node]) async throws -> String {
+        let candidates = try flattenedVariants(variants)
+        guard let first = candidates.first else {
+            throw ConstrainedGenerationError.emptyAnyOf
+        }
+        guard candidates.count > 1 else {
+            return try await generateNode(first)
+        }
+
+        let matching = try await variantsStartingWithSample(candidates).map { candidates[$0] }
+        let objects = matching.compactMap { variant -> GenerationSchema.ObjectNode? in
+            if case .object(let object) = variant { return object }
+            return nil
+        }
+        if objects.count > 1, objects.count == matching.count {
+            return try await generateObject(oneOf: objects).output
+        }
+        // Known limitation: variants that start alike but aren't all objects (two strings,
+        // integer and number, two arrays) can't be told apart by their first token, so the
+        // first of them is generated.
+        return try await generateNode(matching[0])
+    }
+
+    /// Resolves references and flattens nested unions, keeping declaration order.
+    ///
+    /// Each definition is expanded at most once: a later reference to it, including one
+    /// from inside itself, would only repeat variants already in the list. That keeps the
+    /// result linear in the number of definitions, where expanding every reference would
+    /// double the list at each union that refers to the same definition twice.
+    private func flattenedVariants(_ variants: [GenerationSchema.Node]) throws -> [GenerationSchema.Node] {
+        var expanded = Set<String>()
+        return try flattenedVariants(variants, expanded: &expanded)
+    }
+
+    private func flattenedVariants(
+        _ variants: [GenerationSchema.Node],
+        expanded: inout Set<String>
+    ) throws -> [GenerationSchema.Node] {
+        var flattened: [GenerationSchema.Node] = []
+        for variant in variants {
+            switch variant {
+            case .ref(let typeName):
+                guard let referenced = schema.defs[typeName] else {
+                    throw ConstrainedGenerationError.missingReference(typeName)
+                }
+                guard expanded.insert(typeName).inserted else { continue }
+                flattened += try flattenedVariants([referenced], expanded: &expanded)
+            case .anyOf(let nested):
+                flattened += try flattenedVariants(nested, expanded: &expanded)
+            default:
+                flattened.append(variant)
+            }
+        }
+        return flattened
+    }
+
+    /// Samples among the tokens that can start each variant, without decoding the sample,
+    /// and returns the positions of the variants that can start with it. Returns every
+    /// position without sampling when the variants all start alike.
+    private mutating func variantsStartingWithSample(
+        _ variants: [GenerationSchema.Node]
+    ) async throws -> [Int] {
+        let starts = try variants.map { try itemStartTokens(for: $0) }
+        guard starts.dropFirst().contains(where: { $0 != starts[0] }) else {
+            return Array(variants.indices)
+        }
+        let allowed = starts.reduce(into: Set<Int>()) { $0.formUnion($1) }
+        guard !allowed.isEmpty else { return Array(variants.indices) }
+        let token = try await backend.sample(from: allowed)
+        let matching = starts.indices.filter { starts[$0].contains(token) }
+        return matching.isEmpty ? Array(variants.indices) : matching
+    }
+
+    private mutating func generateObject(_ node: GenerationSchema.ObjectNode) async throws -> String {
+        try await generateObject(oneOf: [node]).output
+    }
+
+    /// Generates an object matching one of `variants`.
+    ///
+    /// With several variants, the mask offers the keys of every variant still in play, and
+    /// each emitted key keeps only the variants that declare it.
+    /// When the variants are the cases of an enumeration with associated values,
+    /// the object starts with the case's `type`, whose value chooses the case.
+    ///
+    /// - Returns: The object, and the positions in `variants` of the variants it still matches.
+    private mutating func generateObject(
+        oneOf variants: [GenerationSchema.ObjectNode]
+    ) async throws -> (output: String, live: [Int]) {
+        // Object *key set* is model-driven under the JSON grammar. The previous
+        // implementation pre-filtered optional properties with a hash of the field
+        // name XOR the token budget, so each optional was always-on or always-off
+        // for a given budget — decided before the model was consulted.
+        //
+        // After each property the mask permits any not-yet-emitted key of a live
+        // variant, and permits `}` once some live variant has all of its required
+        // properties. For schemas with no required properties that makes `{}`
+        // reachable (schema-valid, and what the model asked for) — a visible
+        // behaviour change for such schemas.
+        var live = Array(variants.indices)
+        var emittedKeys = Set<String>()
+        var output = try await emit("{")
+
+        // Like Foundation Models, the object of an enumeration case starts with its `type`,
+        // whose value chooses the case. Other unions follow the keys the model writes.
+        if variants.count > 1, let key = try caseTypeKey(of: variants) {
+            output += try await emit("\"\(key)\":")
+            emittedKeys.insert(key)
+            output += try await generateValue(forKey: key, of: variants, narrowing: &live)
+        }
+
+        while true {
+            let liveVariants = live.map { variants[$0] }
+            let remainingKeys = liveVariants.reduce(into: Set<String>()) { $0.formUnion($1.properties.keys) }
+                .subtracting(emittedKeys)
+            if remainingKeys.isEmpty { break }
+            let missingRequired = liveVariants.reduce(into: Set<String>()) { $0.formUnion($1.required) }
+                .intersection(remainingKeys)
+            let closable = live.filter { index in
+                let variant = variants[index]
+                return variant.required.allSatisfy { emittedKeys.contains($0) || variant.properties[$0] == nil }
+            }
+            let canClose = !closable.isEmpty
+            let emittedAnyProperty = !emittedKeys.isEmpty
+            let budgetAllowsMoreOptionals = hasBudgetForOptionalStructure()
+
+            let keysToOffer: [String]
+            if budgetAllowsMoreOptionals {
+                // Model chooses any not-yet-emitted property (required or optional).
+                keysToOffer = remainingKeys.sorted()
+            } else if canClose {
+                // Genuine last resort: stop offering optionals when the budget is nearly
+                // exhausted. Required properties are already present, so close cleanly,
+                // keeping only the variants the object completes.
+                live = closable
+                break
+            } else {
+                // Still missing required keys — only those may be emitted under pressure.
+                keysToOffer = missingRequired.sorted()
+            }
+
+            var candidates: [String] = keysToOffer.map { key in
+                let prefix = emittedAnyProperty ? "," : ""
+                return "\(prefix)\"\(key)\":"
+            }
+            // Closing is legal once some live variant has all of its required properties.
+            // The model may leave remaining optionals out; that is schema-valid JSON.
+            if canClose {
+                candidates.append("}")
+            }
+
+            guard !candidates.isEmpty else { break }
+
+            let choice = try await generateChoice(candidates)
+            output += choice
+
+            // Model elected to close; the keys left out are optional for a closable variant.
+            if choice == "}" {
+                return (output, closable)
+            }
+
+            guard let key = propertyKey(fromPropertyStart: choice) else {
+                throw ConstrainedGenerationError.tokenizationFailed
+            }
+            live = live.filter { variants[$0].properties[key] != nil }
+            guard !live.isEmpty else {
+                throw ConstrainedGenerationError.tokenizationFailed
+            }
+            emittedKeys.insert(key)
+            output += try await generateValue(forKey: key, of: variants, narrowing: &live)
+        }
+
+        output += try await emit("}")
+        return (output, live)
+    }
+
+    /// Generates the value of `key`, keeping in `live` only the variants whose schema for
+    /// it the value matches.
+    ///
+    /// Variants that agree on the key's schema all stay. Variants that name themselves with
+    /// a string choice, like the `type` of an enum case, are told apart by the choice.
+    /// Variants whose values are all objects are told apart by the keys of the nested
+    /// object. Otherwise the value's first token chooses, and the first matching variant stays.
+    private mutating func generateValue(
+        forKey key: String,
+        of variants: [GenerationSchema.ObjectNode],
+        narrowing live: inout [Int]
+    ) async throws -> String {
+        let nodes = live.compactMap { variants[$0].properties[key] }
+        guard let first = nodes.first, nodes.count == live.count else {
+            throw ConstrainedGenerationError.tokenizationFailed
+        }
+        // Descriptions don't change what gets generated, so variants whose schemas for
+        // this key differ only in their descriptions all stay live.
+        let comparable = nodes.map { withoutDescriptions($0) }
+        if comparable.allSatisfy({ $0 == comparable[0] }) {
+            return try await generateNode(first)
+        }
+
+        let choices = try nodes.map { try stringChoices(of: $0) }
+        if choices.allSatisfy({ $0 != nil }) {
+            var all: [String] = []
+            for choice in choices.compactMap({ $0 }).joined() where !all.contains(choice) {
+                all.append(choice)
+            }
+            var output = try await emit("\"")
+            let (value, index) = try await generateIndexedChoice(all)
+            output += value
+            output += try await emit("\"")
+            // Narrow by the choice the sampled tokens spell, not by the text they decode to:
+            // the two differ when a token's text differs from the text it was tokenized
+            // from, like a piece with a leading space. Without a choice, the budget ran out
+            // and the live variants stay as they were.
+            if let index {
+                live = zip(live, choices).filter { $0.1?.contains(all[index]) == true }.map(\.0)
+            }
+            return output
+        }
+
+        let starting = try await variantsStartingWithSample(nodes)
+        if let objects = try distinctObjects(in: starting.map { nodes[$0] }) {
+            // Every value is an object and they all start with `{`, so the nested keys
+            // choose: the variants stay whose nested object the generated one still matches.
+            let (output, survivors) = try await generateObject(oneOf: objects.map(\.object))
+            let kept = Set(survivors.flatMap { objects[$0].owners })
+            live = kept.sorted().map { live[starting[$0]] }
+            return output
+        }
+
+        // Same limitation as in `generateAnyOf(_:)`: among values that start alike, the first
+        // variant's schema is used.
+        let chosen = nodes[starting[0]]
+        let chosenShape = comparable[starting[0]]
+        live = zip(live, comparable).filter { $0.1 == chosenShape }.map(\.0)
+        return try await generateNode(chosen)
+    }
+
+    /// The distinct objects that `nodes` resolve to, each with the positions in `nodes` that
+    /// can be it, or `nil` when a node can be something other than an object.
+    private func distinctObjects(
+        in nodes: [GenerationSchema.Node]
+    ) throws -> [(object: GenerationSchema.ObjectNode, owners: [Int])]? {
+        var objects: [(object: GenerationSchema.ObjectNode, shape: GenerationSchema.Node, owners: [Int])] = []
+        for (position, node) in nodes.enumerated() {
+            let flattened = try flattenedVariants([node])
+            guard !flattened.isEmpty else { return nil }
+            for variant in flattened {
+                guard case .object(let object) = variant else { return nil }
+                let shape = withoutDescriptions(variant)
+                if let index = objects.firstIndex(where: { $0.shape == shape }) {
+                    if !objects[index].owners.contains(position) {
+                        objects[index].owners.append(position)
+                    }
+                } else {
+                    objects.append((object, shape, [position]))
+                }
+            }
+        }
+        return objects.map { ($0.object, $0.owners) }
+    }
+
+    /// How many references one ``withoutDescriptions(_:)`` call resolves before it leaves the
+    /// rest as references.
+    private static var comparableReferenceBudget: Int { 256 }
+
+    /// `node` without any descriptions, so nodes that generate the same values compare equal.
+    ///
+    /// References are resolved, except one already being resolved further up, which stays a
+    /// reference so a recursive definition can't expand forever. Resolution also stops after
+    /// ``comparableReferenceBudget`` references: a definition that refers to another one twice,
+    /// at each level, would otherwise expand exponentially. A reference left unresolved only
+    /// compares equal to the same reference, so two schemas then differ sooner, never later.
+    private func withoutDescriptions(_ node: GenerationSchema.Node) -> GenerationSchema.Node {
+        var budget = Self.comparableReferenceBudget
+        return withoutDescriptions(node, resolving: [], budget: &budget)
+    }
+
+    private func withoutDescriptions(
+        _ node: GenerationSchema.Node,
+        resolving: Set<String>,
+        budget: inout Int
+    ) -> GenerationSchema.Node {
+        switch node {
+        case .object(var object):
+            object.description = nil
+            for key in object.properties.keys.sorted() {
+                object.properties[key] = withoutDescriptions(
+                    object.properties[key]!,
+                    resolving: resolving,
+                    budget: &budget
+                )
+            }
+            return .object(object)
+        case .array(var array):
+            array.description = nil
+            array.items = withoutDescriptions(array.items, resolving: resolving, budget: &budget)
+            return .array(array)
+        case .string(var string):
+            string.description = nil
+            return .string(string)
+        case .number(var number):
+            number.description = nil
+            return .number(number)
+        case .anyOf(let variants):
+            var stripped: [GenerationSchema.Node] = []
+            for variant in variants {
+                stripped.append(withoutDescriptions(variant, resolving: resolving, budget: &budget))
+            }
+            return .anyOf(stripped)
+        case .ref(let typeName):
+            guard budget > 0, !resolving.contains(typeName), let referenced = schema.defs[typeName] else {
+                return node
+            }
+            budget -= 1
+            return withoutDescriptions(referenced, resolving: resolving.union([typeName]), budget: &budget)
+        case .boolean, .null:
+            return node
+        }
+    }
+
+    /// The key that names the case, if every variant is the object of a different case
+    /// of an enumeration with associated values.
+    ///
+    /// That's a required `type` with a different single string choice in each variant,
+    /// as `GenerationSchema(type:description:cases:)` writes it.
+    private func caseTypeKey(of variants: [GenerationSchema.ObjectNode]) throws -> String? {
+        let key = GenerationSchema.caseTypeProperty
+        var names = Set<String>()
+        for variant in variants {
+            guard variant.required.contains(key),
+                let node = variant.properties[key],
+                let choices = try stringChoices(of: node), choices.count == 1,
+                names.insert(choices[0]).inserted
+            else { return nil }
+        }
+        return key
+    }
+
+    /// The choices of a string enum without a pattern, through references.
+    private func stringChoices(of node: GenerationSchema.Node) throws -> [String]? {
+        let flattened = try flattenedVariants([node])
+        guard flattened.count == 1, case .string(let string) = flattened[0], string.pattern == nil,
+            let choices = string.enumChoices, !choices.isEmpty
+        else { return nil }
+        return choices
+    }
+
+    private mutating func generateArray(_ node: GenerationSchema.ArrayNode) async throws -> String {
+        // Array *length* is model-driven under the JSON grammar — same family of fix as
+        // model-driven optional object keys. After each element the mask permits both
+        // continuing (`,`) and closing (`]`), subject to schema `minItems` / `maxItems`.
+        // A budget-derived fixed count (or `totalTokenBudget % rangeSize`) would force the
+        // same length for every document and invent filler or truncate real items.
+        let minItems = max(0, node.minItems ?? 0)
+        let maxItems = node.maxItems
+
+        if let maxItems, minItems > maxItems {
+            throw ConstrainedGenerationError.invalidArrayBounds(
+                "Minimum items \(minItems) exceeds maximum \(maxItems)"
+            )
+        }
+
+        var output = try await emit("[")
+        var count = 0
+
+        while true {
+            if let maxItems, count >= maxItems {
+                break
+            }
+
+            let canClose = count >= minItems
+            let budgetAllowsMore = hasBudgetForOptionalStructure()
+
+            if canClose && !budgetAllowsMore {
+                // Genuine last resort: close once minItems is satisfied rather than
+                // failing mid-element under a hard budget floor.
+                break
+            }
+
+            if count > 0 {
+                if canClose {
+                    // Model chooses continue vs close.
+                    let choice = try await generateChoice([",", "]"])
+                    if choice == "]" {
+                        output += choice
+                        return output
+                    }
+                    output += choice
+                } else {
+                    // Still below minItems — must emit another element.
+                    output += try await emit(",")
+                }
+            } else if canClose {
+                // Empty array is legal (`minItems == 0`). Probe whether the model wants
+                // `]` or a first element. Sampling is non-committing for non-`]` tokens
+                // (see ``sampleWhetherToCloseEmptyArray``); the element is then generated
+                // from the same decode state.
+                if try await sampleWhetherToCloseEmptyArray(items: node.items) {
+                    output += try await emit("]")
+                    return output
+                }
+            }
+
+            output += try await generateNode(node.items)
+            count += 1
+        }
+
+        output += try await emit("]")
+        return output
+    }
+
+    /// Probe after `[` when `minItems == 0`: model may close immediately or start an item.
+    ///
+    /// Samples once among closing tokens and tokens that can start the item type. Choosing
+    /// a close means close; any other sample is discarded without decoding so
+    /// ``generateNode`` can emit the first element from the same backend state.
+    ///
+    /// Byte-pair vocabularies put most item-start probability on merged tokens (a quote
+    /// fused with the first word, or a leading space), so the probe admits every token
+    /// whose first non-whitespace character starts the item type, not just the bare
+    /// single-character token.
+    private mutating func sampleWhetherToCloseEmptyArray(
+        items: GenerationSchema.Node
+    ) async throws -> Bool {
+        let closeTokens = tokensMatchingTrimmed("]")
+        var allowed = try itemStartTokens(for: items)
+        allowed.formUnion(closeTokens)
+        guard !allowed.isEmpty, !closeTokens.isEmpty else {
+            return false
+        }
+        let token = try await backend.sample(from: allowed)
+        return closeTokens.contains(token)
+    }
+
+    /// Tokens whose text equals `text` after trimming surrounding whitespace.
+    private func tokensMatchingTrimmed(_ text: String) -> Set<Int> {
+        var tokens = Set<Int>()
+        for token in 0 ..< backend.vocabSize {
+            if backend.isSpecialToken(token) { continue }
+            guard let tokenText = backend.tokenText(token) else { continue }
+            if tokenText.trimmingCharacters(in: .whitespacesAndNewlines) == text {
+                tokens.insert(token)
+            }
+        }
+        return tokens
+    }
+
+    /// Tokens whose text, after leading whitespace, is a non-empty prefix of one of `literals`.
+    private func tokensPrefixing(anyOf literals: [String]) -> Set<Int> {
+        var tokens = Set<Int>()
+        for token in 0 ..< backend.vocabSize {
+            if backend.isSpecialToken(token) { continue }
+            guard let text = backend.tokenText(token) else { continue }
+            let trimmed = text.drop(while: { $0.isWhitespace })
+            guard !trimmed.isEmpty else { continue }
+            if literals.contains(where: { $0.hasPrefix(trimmed) }) {
+                tokens.insert(token)
+            }
+        }
+        return tokens
+    }
+
+    /// Tokens whose first non-whitespace character is `prefix`.
+    private func tokensStarting(with prefix: Character) -> Set<Int> {
+        var tokens = Set<Int>()
+        for token in 0 ..< backend.vocabSize {
+            if backend.isSpecialToken(token) { continue }
+            guard let text = backend.tokenText(token) else { continue }
+            guard let first = text.drop(while: { $0.isWhitespace }).first else { continue }
+            if first == prefix {
+                tokens.insert(token)
+            }
+        }
+        return tokens
+    }
+
+    /// Tokens that can begin a JSON value for `node` (empty-array probe).
+    private func itemStartTokens(for node: GenerationSchema.Node) throws -> Set<Int> {
+        switch node {
+        case .string:
+            return tokensStarting(with: "\"")
+        case .object:
+            return tokensStarting(with: "{")
+        case .array:
+            return tokensStarting(with: "[")
+        case .boolean:
+            return tokensPrefixing(anyOf: ["true", "false"])
+        case .null:
+            return tokensPrefixing(anyOf: ["null"])
+        case .number(let numberNode):
+            let numeric =
+                numberNode.integerOnly
+                ? integerTerminators.subtracting(basicTerminators)
+                : doubleTerminators.subtracting(basicTerminators)
+            // Only tokens that can start a number (digit or minus — not a bare `.`).
+            return Set(
+                numeric.filter { token in
+                    guard let text = backend.tokenText(token),
+                        let first = text.drop(while: { $0.isWhitespace }).first
+                    else { return false }
+                    return first.isNumber || first == "-"
+                }
+            )
+        case .ref(let typeName):
+            guard let referenced = schema.defs[typeName] else {
+                throw ConstrainedGenerationError.missingReference(typeName)
+            }
+            return try itemStartTokens(for: referenced)
+        case .anyOf(let variants):
+            var tokens = Set<Int>()
+            for variant in variants {
+                tokens.formUnion(try itemStartTokens(for: variant))
+            }
+            return tokens
+        }
+    }
+
+    private mutating func generateString(_ node: GenerationSchema.StringNode) async throws -> String {
+        var output = try await emit("\"")
+        let content: String
+        let pattern = node.pattern
+        let regex = try pattern.map { try compilePattern($0) }
+
+        if let choices = node.enumChoices, !choices.isEmpty {
+            let applicableChoices: [String]
+            if let pattern, let regex {
+                let filtered = choices.filter { matchesPattern($0, regex: regex) }
+                guard !filtered.isEmpty else {
+                    throw ConstrainedGenerationError.patternMismatch(
+                        "No enum choices match pattern '\(pattern)'"
+                    )
+                }
+                applicableChoices = filtered
+            } else {
+                applicableChoices = choices
+            }
+            content = try await generateChoice(applicableChoices)
+        } else {
+            content = try await generateFreeString(maxTokens: maxFreeStringTokens())
+        }
+
+        if let pattern, let regex {
+            if !matchesPattern(content, regex: regex) {
+                throw ConstrainedGenerationError.patternMismatch(
+                    "Value '\(content)' does not match pattern '\(pattern)'"
+                )
+            }
+        }
+
+        output += content
+        output += try await emit("\"")
+        return output
+    }
+
+    /// Whether enough budget remains to *offer* more optional structure to the model
+    /// (object properties or array elements).
+    ///
+    /// This is a last-resort guard only. It does not pick which optionals appear or how
+    /// long an array is — those decisions are made by constrained sampling.
+    private func hasBudgetForOptionalStructure() -> Bool {
+        let minimumBudget = OptionalStructureBudget.minimumBudget(
+            totalTokenBudget: backend.totalTokenBudget
+        )
+        return backend.remainingTokens > minimumBudget
+    }
+
+    /// Parses a property-start fragment produced for object key selection.
+    ///
+    /// Expected shapes: `"key":` (first property) or `,"key":` (subsequent).
+    private func propertyKey(fromPropertyStart choice: String) -> String? {
+        var fragment = choice
+        if fragment.first == "," {
+            fragment.removeFirst()
+        }
+        guard fragment.first == "\"", fragment.hasSuffix("\":") else { return nil }
+        fragment.removeFirst()
+        fragment.removeLast(2)
+        return fragment
+    }
+
+    private func deterministicChoice(from candidates: [String]) -> String {
+        guard !candidates.isEmpty else { return "" }
+        if candidates.contains("") { return "" }
+        return candidates.max(by: { $0.count < $1.count }) ?? ""
+    }
+
+    /// A simple trie node used to detect prefix collisions between token sequences.
+    private final class PrefixTrieNode {
+        var children: [Int: PrefixTrieNode] = [:]
+        var isTerminal: Bool = false
+
+        func insertAndCheckCollision(_ sequence: [Int]) -> Bool {
+            var current = self
+
+            if sequence.isEmpty {
+                if current.isTerminal { return false }
+                if !current.children.isEmpty { return true }
+                current.isTerminal = true
+                return false
+            }
+
+            for (index, token) in sequence.enumerated() {
+                if current.isTerminal { return true }
+
+                if let child = current.children[token] {
+                    current = child
+                } else {
+                    let child = PrefixTrieNode()
+                    current.children[token] = child
+                    current = child
+                }
+
+                if index == sequence.count - 1 {
+                    if current.isTerminal { return false }
+                    if !current.children.isEmpty { return true }
+                    current.isTerminal = true
+                }
+            }
+
+            return false
+        }
+    }
+
+    private static func hasPrefixCollision(tokenized: [[Int]]) -> Bool {
+        let root = PrefixTrieNode()
+        for sequence in tokenized {
+            if root.insertAndCheckCollision(sequence) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private func compilePattern(_ pattern: String) throws -> NSRegularExpression {
+        do {
+            return try NSRegularExpression(pattern: pattern)
+        } catch {
+            throw ConstrainedGenerationError.patternMismatch("Invalid pattern '\(pattern)'")
+        }
+    }
+
+    private func matchesPattern(_ value: String, regex: NSRegularExpression) -> Bool {
+        let range = NSRange(value.startIndex..., in: value)
+        return regex.firstMatch(in: value, range: range) != nil
+    }
+}
+
+// MARK: - Errors
+
+/// An error that can occur during constrained JSON generation.
+enum ConstrainedGenerationError: LocalizedError {
+    /// A required value failed to tokenize.
+    case tokenizationFailed
+
+    /// The generation exceeded the available token budget.
+    case tokenBudgetExceeded
+
+    /// The tokenizer does not support a required single-token encoding.
+    ///
+    /// The associated value contains a user-facing description.
+    case unsupportedTokenizer(String)
+
+    /// The generated value does not match the required pattern.
+    ///
+    /// The associated value contains a user-facing description.
+    case patternMismatch(String)
+
+    /// The generated number violates numeric bounds or is invalid.
+    ///
+    /// The associated value contains a user-facing description.
+    case numberOutOfRange(String)
+
+    /// The backend emitted an end token before completion.
+    ///
+    /// The associated value contains the partial output.
+    case earlyTermination(String)
+
+    /// The array bounds are invalid.
+    ///
+    /// The associated value contains a user-facing description.
+    case invalidArrayBounds(String)
+
+    /// A referenced schema definition is missing.
+    case missingReference(String)
+
+    /// An any-of schema has no choices.
+    case emptyAnyOf
+
+    var errorDescription: String? {
+        switch self {
+        case .tokenizationFailed:
+            return "Failed to tokenize a required value"
+        case .tokenBudgetExceeded:
+            return "Generation exceeded the available token budget"
+        case .unsupportedTokenizer(let details):
+            return details
+        case .patternMismatch(let details):
+            return details
+        case .numberOutOfRange(let details):
+            return details
+        case .earlyTermination:
+            return "End token was generated before completion"
+        case .invalidArrayBounds(let details):
+            return details
+        case .missingReference(let name):
+            return "Missing referenced schema definition '\(name)'"
+        case .emptyAnyOf:
+            return "Any-of schema has no choices"
+        }
+    }
+}

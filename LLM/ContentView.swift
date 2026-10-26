@@ -9,13 +9,15 @@ struct ContentView: View {
     @State private var modelCache = ModelCacheManager()
     @State private var selectedTab = 0
     @State private var question = ""
+    @State private var isSending = false
     @FocusState private var questionFieldFocused: Bool
     @State private var isShowingHistory = false
     @State private var isShowingThreads = false
     @State private var isShowingModels = false
 
     private var canSend: Bool {
-        !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !chat.isBusy
+        !question.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !chat.isBusy && !isSending
+            && !voice.isRecording && !voice.isFinishingRecognition
     }
 
     var body: some View {
@@ -79,7 +81,7 @@ struct ContentView: View {
                         HStack(spacing: 10) {
                             ProgressView()
                                 .tint(.indigo)
-                            Text("Türkçe ses hazırlanıyor; EMA ilk kullanımda model dosyalarını indirir…")
+                            Text(voice.speechPreparationMessage)
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                             Spacer()
@@ -169,7 +171,7 @@ struct ContentView: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(selectedTab == index ? .isSelected : [])
-        .disabled((chat.isBusy || rag.isBusy || jev.isBusy) && selectedTab != index)
+        .disabled((chat.isBusy || rag.isBusy || jev.isBusy || voice.isGeneratingSpeech || isSending) && selectedTab != index)
     }
 
     private var header: some View {
@@ -348,14 +350,19 @@ struct ContentView: View {
 
             Menu {
                 Toggle("Yanıtları otomatik oku", isOn: $voice.speaksReplies)
-                Toggle("EMA ONNX deneysel ses", isOn: $voice.usesEMASpeech)
+                Picker("Seslendirme motoru", selection: $voice.speechEngine) {
+                    ForEach(SpeechEngine.allCases) { engine in
+                        Text(engine.title).tag(engine)
+                    }
+                }
             } label: {
-                Image(systemName: voice.usesEMASpeech ? "waveform" : "speaker.wave.2.fill")
+                Image(systemName: voice.usesLocalSpeechModel ? "waveform" : "speaker.wave.2.fill")
                     .font(.system(size: 16, weight: .semibold))
                     .foregroundStyle(voice.speaksReplies ? .indigo : .secondary)
                     .frame(width: 38, height: 46)
             }
             .accessibilityLabel("Seslendirme ayarları")
+            .accessibilityValue(voice.speechEngine.title)
 
             Button {
                 if voice.isRecording {
@@ -401,14 +408,14 @@ struct ContentView: View {
         let prompt = question.trimmingCharacters(in: .whitespacesAndNewlines)
         question = ""
         questionFieldFocused = false
+        isSending = true
         voice.beginStreamingReply()
         Task {
+            defer { isSending = false }
+            await voice.waitForSpeechCompletion()
             if let result = await chat.send(prompt, onToken: { token in
                 voice.appendReplyText(token)
             }) {
-                if voice.usesEMASpeech {
-                    chat.releaseModelForSpeech()
-                }
                 voice.finishStreamingReply()
                 history.add(
                     kind: .chat,

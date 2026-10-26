@@ -1,0 +1,1585 @@
+import EventSource
+import Foundation
+import JSONSchema
+import OrderedCollections
+
+#if canImport(FoundationNetworking)
+    import FoundationNetworking
+#endif
+
+/// A language model that connects to Anthropic's Claude API.
+///
+/// Use this model to generate text using Claude models from Anthropic.
+///
+/// ```swift
+/// let model = AnthropicLanguageModel(
+///     apiKey: "your-api-key",
+///     model: "claude-3-5-sonnet-20241022"
+/// )
+/// ```
+///
+/// You can also specify beta headers to access experimental features:
+///
+/// ```swift
+/// let model = AnthropicLanguageModel(
+///     apiKey: "your-api-key",
+///     model: "claude-3-5-sonnet-20241022",
+///     betas: ["beta1", "beta2"]
+/// )
+/// ```
+public struct AnthropicLanguageModel: LanguageModel {
+    /// Custom generation options specific to Anthropic's Claude API.
+    ///
+    /// Reached through `GenerationOptions[custom: AnthropicLanguageModel.self]`,
+    /// an AnyLanguageModel extension.
+    ///
+    /// Use this type to pass additional parameters that are not part of the
+    /// standard ``GenerationOptions``, such as Anthropic-specific sampling
+    /// parameters and metadata.
+    ///
+    /// ```swift
+    /// var options = GenerationOptions(temperature: 0.7)
+    /// options[custom: AnthropicLanguageModel.self] = .init(
+    ///     topP: 0.9,
+    ///     topK: 40,
+    ///     stopSequences: ["END", "STOP"]
+    /// )
+    /// ```
+    public struct CustomGenerationOptions: AnyLanguageModel.CustomGenerationOptions, Codable {
+        /// Use nucleus sampling with probability mass `topP`.
+        ///
+        /// In nucleus sampling, tokens are sorted by probability and added to a
+        /// pool until the cumulative probability exceeds `topP`. A token is then
+        /// sampled from the pool. We recommend altering either `temperature` or
+        /// `topP`, but not both.
+        ///
+        /// Recommended range: `0.0` to `1.0`. Defaults to `nil` (not specified).
+        public var topP: Double?
+
+        /// Only sample from the top K options for each subsequent token.
+        ///
+        /// Used to remove "long tail" low probability responses. We recommend
+        /// using `topP` instead, or combining `topK` with `topP`.
+        ///
+        /// Recommended range: `0` to `500`. Defaults to `nil` (not specified).
+        public var topK: Int?
+
+        /// Custom text sequences that will cause the model to stop generating.
+        ///
+        /// Our models will normally stop when they have naturally completed their turn,
+        /// which will result in a response `stop_reason` of `"end_turn"`.
+        ///
+        /// If you want the model to stop generating when it encounters custom strings
+        /// of text, you can use the `stop_sequences` parameter. If the model encounters
+        /// one of the custom sequences, the response `stop_reason` value will be
+        /// `"stop_sequence"` and the response `stop_sequence` value will contain the
+        /// matched stop sequence.
+        public var stopSequences: [String]?
+
+        /// An object describing metadata about the request.
+        public var metadata: Metadata?
+
+        /// How the model should use the provided tools.
+        ///
+        /// Use this to control whether the model can use tools and which tools it prefers.
+        public var toolChoice: ToolChoice?
+
+        /// Configuration for extended thinking.
+        ///
+        /// When enabled, the model will use internal reasoning before responding,
+        /// which can improve performance on complex tasks.
+        public var thinking: Thinking?
+
+        /// Specifies the tier of service to use for the request.
+        ///
+        /// The default is "auto", which will use the priority tier if available
+        /// and fall back to standard.
+        public var serviceTier: ServiceTier?
+
+        /// Additional parameters to include in the request body.
+        ///
+        /// These parameters are merged into the top-level request JSON,
+        /// allowing you to pass additional options not explicitly modeled.
+        public var extraBody: [String: JSONValue]?
+
+        /// How much effort the model should put into the response.
+        ///
+        /// Higher effort can improve results on difficult tasks but may use more tokens.
+        /// Not every model accepts every effort level.
+        /// When `nil`, the request omits this option and uses the API's default effort.
+        public var effort: Effort?
+
+        // MARK: - Nested Types
+
+        /// Metadata about the request.
+        public struct Metadata: Hashable, Codable, Sendable {
+            /// An external identifier for the user who is associated with the request.
+            ///
+            /// This should be a UUID, hash value, or other opaque identifier.
+            /// Anthropic may use this ID to help detect abuse. Do not include any
+            /// identifying information such as name, email address, or phone number.
+            public var userID: String?
+
+            enum CodingKeys: String, CodingKey {
+                case userID = "user_id"
+            }
+
+            /// Creates metadata for an Anthropic request.
+            ///
+            /// - Parameter userID: An external identifier for the user.
+            public init(userID: String? = nil) {
+                self.userID = userID
+            }
+        }
+
+        /// Controls how the model uses tools.
+        public enum ToolChoice: Hashable, Codable, Sendable {
+            /// The model automatically decides whether to use tools.
+            case auto
+
+            /// The model must use one of the provided tools.
+            case any
+
+            /// The model must use the specified tool.
+            case tool(name: String)
+
+            /// The model will not be allowed to use tools.
+            case disabled
+
+            enum CodingKeys: String, CodingKey {
+                case type
+                case name
+                case disableParallelToolUse = "disable_parallel_tool_use"
+            }
+
+            public init(from decoder: any Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                let type = try container.decode(String.self, forKey: .type)
+
+                switch type {
+                case "auto":
+                    self = .auto
+                case "any":
+                    self = .any
+                case "tool":
+                    let name = try container.decode(String.self, forKey: .name)
+                    self = .tool(name: name)
+                case "none":
+                    self = .disabled
+                default:
+                    self = .auto
+                }
+            }
+
+            public func encode(to encoder: any Encoder) throws {
+                var container = encoder.container(keyedBy: CodingKeys.self)
+
+                switch self {
+                case .auto:
+                    try container.encode("auto", forKey: .type)
+                case .any:
+                    try container.encode("any", forKey: .type)
+                case .tool(let name):
+                    try container.encode("tool", forKey: .type)
+                    try container.encode(name, forKey: .name)
+                case .disabled:
+                    try container.encode("none", forKey: .type)
+                }
+            }
+        }
+
+        /// Configuration for extended thinking.
+        ///
+        /// Enabled thinking requires a token budget, and adaptive thinking must omit it.
+        /// Encoding an invalid combination throws `EncodingError.invalidValue`.
+        public struct Thinking: Hashable, Codable, Sendable {
+            /// The type of thinking to use.
+            public var type: ThinkingType
+
+            /// The maximum number of tokens to use for thinking. Omitted for adaptive thinking.
+            ///
+            /// This budget is the maximum number of tokens the model can use for its
+            /// internal reasoning process. Larger budgets can improve response quality
+            /// for complex tasks but increase latency and cost.
+            public var budgetTokens: Int?
+
+            /// How thinking should be returned by the API.
+            ///
+            /// Thinking content is exposed as reasoning transcript entries.
+            public var display: ThinkingDisplay?
+
+            /// The type of thinking mode.
+            public enum ThinkingType: String, Hashable, Codable, Sendable {
+                /// Enables extended thinking.
+                case enabled
+                /// Enables adaptive thinking.
+                case adaptive
+            }
+
+            /// How thinking should be returned during generation.
+            public enum ThinkingDisplay: String, Hashable, Codable, Sendable {
+                /// Thinking will be summarized.
+                case summarized
+                /// No thoughts will be returned.
+                case omitted
+            }
+
+            enum CodingKeys: String, CodingKey {
+                case type
+                case budgetTokens = "budget_tokens"
+                case display
+            }
+
+            public func encode(to encoder: any Encoder) throws {
+                switch (type, budgetTokens) {
+                case (.enabled, nil), (.adaptive, .some):
+                    throw EncodingError.invalidValue(
+                        self,
+                        .init(
+                            codingPath: encoder.codingPath,
+                            debugDescription:
+                                "Enabled thinking requires a token budget; adaptive thinking must omit it."
+                        )
+                    )
+                default:
+                    break
+                }
+
+                var container = encoder.container(keyedBy: CodingKeys.self)
+                try container.encode(type, forKey: .type)
+                try container.encodeIfPresent(budgetTokens, forKey: .budgetTokens)
+                try container.encodeIfPresent(display, forKey: .display)
+            }
+
+            /// Creates a thinking configuration.
+            ///
+            /// - Parameters:
+            ///   - type: The type of thinking to perform.
+            ///   - budgetTokens: The maximum number of tokens to use for thinking. Only required when `type` == `.enabled`.
+            ///   - display: The display type for thoughts.
+            private init(type: ThinkingType, budgetTokens: Int?, display: ThinkingDisplay?) {
+                self.type = type
+                self.budgetTokens = budgetTokens
+                self.display = display
+            }
+
+            /// Creates an enabled thinking configuration with a token budget.
+            ///
+            /// - Parameter budgetTokens: The maximum number of tokens to use for thinking.
+            public init(budgetTokens: Int) {
+                self.init(type: .enabled, budgetTokens: budgetTokens, display: nil)
+            }
+
+            /// Convenience function for enabling adaptive thinking on supported models.
+            public static func adaptive(display: ThinkingDisplay? = nil) -> Thinking {
+                Thinking(type: .adaptive, budgetTokens: nil, display: display)
+            }
+
+            /// Convenience function for enabling thinking with a token budget on supported models.
+            public static func enabled(budgetTokens: Int, display: ThinkingDisplay? = nil) -> Thinking {
+                Thinking(type: .enabled, budgetTokens: budgetTokens, display: display)
+            }
+        }
+
+        /// The tier of service for processing the request.
+        public enum ServiceTier: String, Hashable, Codable, Sendable {
+            /// Automatically select the best available tier.
+            case auto
+
+            /// Standard tier processing.
+            case standard
+
+            /// Priority tier processing with faster response times.
+            case priority
+        }
+
+        /// How much effort the model should put into a task.
+        ///
+        /// Supported levels vary by model. See the
+        /// [Anthropic effort documentation](https://platform.claude.com/docs/en/build-with-claude/effort).
+        public enum Effort: String, Hashable, Codable, Sendable {
+            /// The highest effort level for the most demanding tasks.
+            case max
+            /// Extended effort for long-running agentic and coding tasks.
+            case extraHigh = "xhigh"
+            /// High effort, equivalent to omitting the parameter.
+            case high
+            /// Moderate effort that balances capability and token usage.
+            case medium
+            /// Lower effort that prioritizes speed and token efficiency.
+            case low
+        }
+
+        /// Creates custom generation options for Anthropic's Claude API.
+        ///
+        /// - Parameters:
+        ///   - topP: Use nucleus sampling with this probability mass.
+        ///   - topK: Only sample from the top K options for each token.
+        ///   - stopSequences: Custom text sequences that will cause the model to stop generating.
+        ///   - metadata: An object describing metadata about the request.
+        ///   - toolChoice: How the model should use the provided tools.
+        ///   - thinking: Configuration for extended thinking.
+        ///   - serviceTier: The tier of service to use for the request.
+        ///   - extraBody: Additional parameters to include in the request body.
+        ///   - effort: How much effort the model should put into the response.
+        public init(
+            topP: Double? = nil,
+            topK: Int? = nil,
+            stopSequences: [String]? = nil,
+            metadata: Metadata? = nil,
+            toolChoice: ToolChoice? = nil,
+            thinking: Thinking? = nil,
+            serviceTier: ServiceTier? = nil,
+            extraBody: [String: JSONValue]? = nil,
+            effort: Effort? = nil
+        ) {
+            self.topP = topP
+            self.topK = topK
+            self.stopSequences = stopSequences
+            self.metadata = metadata
+            self.toolChoice = toolChoice
+            self.thinking = thinking
+            self.serviceTier = serviceTier
+            self.extraBody = extraBody
+            self.effort = effort
+        }
+    }
+    /// The reason the model is unavailable.
+    /// This model is always available.
+    public typealias UnavailableReason = Never
+
+    /// The default base URL for Anthropic's API.
+    public static let defaultBaseURL = URL(string: "https://api.anthropic.com")!
+
+    /// The default API version for Anthropic's API.
+    public static let defaultAPIVersion = "2023-06-01"
+
+    /// The base URL for the API endpoint.
+    public let baseURL: URL
+
+    /// The closure providing the API key for authentication.
+    private let tokenProvider: @Sendable () -> String
+
+    /// The API version to use for requests.
+    public let apiVersion: String
+
+    /// Optional beta version(s) of the API to use.
+    public let betas: [String]?
+
+    /// The model identifier to use for generation.
+    public let model: String
+
+    private let httpSession: HTTPSession
+
+    /// Creates an Anthropic language model.
+    ///
+    /// - Parameters:
+    ///   - baseURL: The base URL for the API endpoint. Defaults to Anthropic's official API.
+    ///   - apiKey: Your Anthropic API key or a closure that returns it.
+    ///   - apiVersion: The API version to use for requests. Defaults to `2023-06-01`.
+    ///   - betas: Optional beta version(s) of the API to use.
+    ///   - model: The model identifier (for example, "claude-3-5-sonnet-20241022").
+    ///   - session: The HTTP session or client used for network requests.
+    public init(
+        baseURL: URL = defaultBaseURL,
+        apiKey tokenProvider: @escaping @autoclosure @Sendable () -> String,
+        apiVersion: String = defaultAPIVersion,
+        betas: [String]? = nil,
+        model: String,
+        session: HTTPSession = makeDefaultSession(),
+    ) {
+        var baseURL = baseURL
+        if !baseURL.path.hasSuffix("/") {
+            baseURL = baseURL.appendingPathComponent("")
+        }
+
+        self.baseURL = baseURL
+        self.tokenProvider = tokenProvider
+        self.apiVersion = apiVersion
+        self.betas = betas
+        self.model = model
+        self.httpSession = session
+    }
+
+    public func respond<Content>(
+        within session: LanguageModelSession,
+        to prompt: Prompt,
+        generating type: Content.Type,
+        includeSchemaInPrompt: Bool,
+        options: GenerationOptions
+    ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
+        try await respond(
+            within: session,
+            to: prompt,
+            generating: type,
+            schema: type.generationSchema,
+            includeSchemaInPrompt: includeSchemaInPrompt,
+            options: options
+        )
+    }
+
+    public func respond(
+        within session: LanguageModelSession,
+        to prompt: Prompt,
+        schema: GenerationSchema,
+        includeSchemaInPrompt: Bool,
+        options: GenerationOptions
+    ) async throws -> LanguageModelSession.Response<GeneratedContent> {
+        try await respond(
+            within: session,
+            to: prompt,
+            generating: GeneratedContent.self,
+            schema: schema,
+            includeSchemaInPrompt: includeSchemaInPrompt,
+            options: options
+        )
+    }
+
+    private func respond<Content>(
+        within session: LanguageModelSession,
+        to prompt: Prompt,
+        generating type: Content.Type,
+        schema: GenerationSchema,
+        includeSchemaInPrompt: Bool,
+        options: GenerationOptions
+    ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
+        let url = baseURL.appendingPathComponent("v1/messages")
+        let headers = buildHeaders()
+        let requestContext = session.resolvedRequestContext()
+
+        // Convert available tools to Anthropic format
+        let anthropicTools: [AnthropicTool] = try requestContext.tools.map { tool in
+            try convertToolToAnthropicFormat(tool)
+        }
+
+        let responseSchema = type == String.self ? nil : try convertSchemaToAnthropicFormat(schema)
+        let params = try createMessageParams(
+            model: model,
+            system: nil,
+            messages: try requestContext.transcript.toAnthropicMessages(),
+            tools: anthropicTools.isEmpty ? nil : anthropicTools,
+            responseSchema: responseSchema,
+            options: options
+        )
+
+        let body = try JSONEncoder().encode(params)
+
+        let message: AnthropicMessageResponse = try await httpSession.fetch(
+            .post,
+            url: url,
+            headers: headers,
+            body: body
+        )
+
+        var entries: [Transcript.Entry] = message.content.compactMap { block in
+            switch block {
+            case .thinking(let thinking): return .reasoning(thinking.transcriptReasoning())
+            case .redactedThinking(let redacted): return .reasoning(redacted.transcriptReasoning())
+            default: return nil
+            }
+        }
+        let usage = message.usage?.reportedUsage?.value ?? .zero
+
+        // Handle tool calls, if present
+        let toolUses: [AnthropicToolUse] = message.content.compactMap { block in
+            if case .toolUse(let u) = block { return u }
+            return nil
+        }
+
+        if !toolUses.isEmpty {
+            let resolution = try await resolveToolUses(
+                toolUses,
+                tools: requestContext.tools,
+                session: session
+            )
+            switch resolution {
+            case .stop(let calls):
+                if !calls.isEmpty {
+                    entries.append(.toolCalls(Transcript.ToolCalls(calls)))
+                }
+                let empty = try emptyResponseContent(for: type)
+                return LanguageModelSession.Response(
+                    content: empty.content,
+                    rawContent: empty.rawContent,
+                    transcriptEntries: ArraySlice(entries),
+                    usage: usage
+                )
+            case .invocations(let invocations):
+                if !invocations.isEmpty {
+                    entries.append(.toolCalls(Transcript.ToolCalls(invocations.map(\.call))))
+                    for invocation in invocations {
+                        entries.append(.toolOutput(invocation.output))
+                    }
+                }
+            }
+        }
+
+        let text = message.content.compactMap { block -> String? in
+            switch block {
+            case .text(let t): return t.text
+            default: return nil
+            }
+        }.joined()
+
+        if type == String.self {
+            return LanguageModelSession.Response(
+                content: text as! Content,
+                rawContent: GeneratedContent(text),
+                transcriptEntries: ArraySlice(entries),
+                usage: usage
+            )
+        }
+
+        let rawContent = try GeneratedContent(json: text)
+        let content = try Content(rawContent)
+        return LanguageModelSession.Response(
+            content: content,
+            rawContent: rawContent,
+            transcriptEntries: ArraySlice(entries),
+            usage: usage
+        )
+    }
+
+    public func streamResponse<Content>(
+        within session: LanguageModelSession,
+        to prompt: Prompt,
+        generating type: Content.Type,
+        includeSchemaInPrompt: Bool,
+        options: GenerationOptions
+    ) -> sending LanguageModelSession.ResponseStream<Content> where Content: Generable {
+        streamResponse(
+            within: session,
+            to: prompt,
+            generating: type,
+            schema: type.generationSchema,
+            includeSchemaInPrompt: includeSchemaInPrompt,
+            options: options
+        )
+    }
+
+    public func streamResponse(
+        within session: LanguageModelSession,
+        to prompt: Prompt,
+        schema: GenerationSchema,
+        includeSchemaInPrompt: Bool,
+        options: GenerationOptions
+    ) -> sending LanguageModelSession.ResponseStream<GeneratedContent> {
+        streamResponse(
+            within: session,
+            to: prompt,
+            generating: GeneratedContent.self,
+            schema: schema,
+            includeSchemaInPrompt: includeSchemaInPrompt,
+            options: options
+        )
+    }
+
+    private func streamResponse<Content>(
+        within session: LanguageModelSession,
+        to prompt: Prompt,
+        generating type: Content.Type,
+        schema: GenerationSchema,
+        includeSchemaInPrompt: Bool,
+        options: GenerationOptions
+    ) -> sending LanguageModelSession.ResponseStream<Content> where Content: Generable {
+        let url = baseURL.appendingPathComponent("v1/messages")
+
+        let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init {
+            continuation in
+            let task = Task { @Sendable in
+                do {
+                    let headers = buildHeaders()
+                    let responseSchema =
+                        type == String.self ? nil : try convertSchemaToAnthropicFormat(schema)
+                    var inFlightMessages: [AnthropicMessage] = []
+                    var state = StreamingResponseState<Content>()
+                    var toolRounds = ToolRoundLimit(provider: "Anthropic")
+                    while true {
+                        try Task.checkCancellation()
+                        let requestContext = session.resolvedRequestContext()
+                        let anthropicTools: [AnthropicTool] = try requestContext.tools.map {
+                            try convertToolToAnthropicFormat($0)
+                        }
+                        let messages = try requestContext.transcript.toAnthropicMessages() + inFlightMessages
+                        var params = try createMessageParams(
+                            model: model,
+                            system: nil,
+                            messages: messages,
+                            tools: anthropicTools.isEmpty ? nil : anthropicTools,
+                            responseSchema: responseSchema,
+                            options: options
+                        )
+                        params["stream"] = .bool(true)
+                        let body = try JSONEncoder().encode(params)
+                        let events: AsyncThrowingStream<AnthropicStreamEvent, any Error> =
+                            httpSession.fetchEventStream(.post, url: url, headers: headers, body: body)
+                        var blocks: [Int: AnthropicStreamBlock] = [:]
+                        var lastSnapshot: LanguageModelSession.ResponseStream<Content>.Snapshot?
+
+                        func snapshot() -> LanguageModelSession.ResponseStream<Content>.Snapshot? {
+                            if type == String.self { return state.snapshot() }
+                            guard
+                                var snapshot: LanguageModelSession.ResponseStream<Content>.Snapshot =
+                                    try? partialSnapshot(from: state.text)
+                            else { return nil }
+                            snapshot.usage = state.totalUsage
+                            snapshot.transcriptEntries = ArraySlice(state.entries)
+                            return snapshot
+                        }
+
+                        responseEvents: for try await event in events {
+                            switch event {
+                            case .contentBlockStart(let start):
+                                blocks[start.index] = AnthropicStreamBlock(start.contentBlock)
+                                if let reasoning = blocks[start.index]?.reasoningEntry {
+                                    state.entries.append(.reasoning(reasoning))
+                                    if let current = snapshot() { lastSnapshot = current; continuation.yield(current) }
+                                }
+                            case .contentBlockDelta(let delta):
+                                switch delta.delta {
+                                case .textDelta(let textDelta):
+                                    state.text += textDelta.text
+                                    blocks[delta.index]?.text += textDelta.text
+                                    if let snapshot = snapshot() {
+                                        lastSnapshot = snapshot
+                                        continuation.yield(snapshot)
+                                    }
+                                case .inputJsonDelta(let input):
+                                    blocks[delta.index]?.arguments += input.partialJson
+                                case .thinkingDelta(let thinking):
+                                    blocks[delta.index]?.thinking += thinking.thinking
+                                    if let reasoning = blocks[delta.index]?.reasoningEntry,
+                                        let index = state.entries.firstIndex(where: { $0.id == reasoning.id })
+                                    {
+                                        state.entries[index] = .reasoning(reasoning)
+                                    }
+                                    if let current = snapshot() { lastSnapshot = current; continuation.yield(current) }
+                                case .signatureDelta(let signature):
+                                    blocks[delta.index]?.signature += signature.signature
+                                    if let reasoning = blocks[delta.index]?.reasoningEntry,
+                                        let index = state.entries.firstIndex(where: { $0.id == reasoning.id })
+                                    {
+                                        state.entries[index] = .reasoning(reasoning)
+                                    }
+                                    if let current = snapshot() { lastSnapshot = current; continuation.yield(current) }
+                                case .ignored:
+                                    break
+                                }
+                            case .messageStart(let start):
+                                state.usage.merge(start.message.usage?.reportedUsage)
+                            case .messageDelta(let delta):
+                                state.usage.merge(delta.usage?.reportedUsage)
+                                if delta.usage?.reportedUsage != nil {
+                                    if var current = lastSnapshot {
+                                        current.usage = state.totalUsage
+                                        lastSnapshot = current
+                                        continuation.yield(current)
+                                    } else if let current = state.snapshot() {
+                                        lastSnapshot = current
+                                        continuation.yield(current)
+                                    }
+                                }
+                            case .messageStop:
+                                if lastSnapshot == nil, !state.usage.isEmpty, let snapshot = state.snapshot() {
+                                    continuation.yield(snapshot)
+                                }
+                                break responseEvents
+                            case .contentBlockStop, .ping, .ignored:
+                                break
+                            }
+                        }
+                        let content = try blocks.keys.sorted().compactMap { try blocks[$0]?.content() }
+                        let toolUses = content.compactMap { block -> AnthropicToolUse? in
+                            if case .toolUse(let use) = block { return use }
+                            return nil
+                        }
+                        guard !toolUses.isEmpty else { break }
+                        try Task.checkCancellation()
+                        try toolRounds.record(toolUses.map(\.roundCall))
+                        switch try await resolveToolUses(
+                            toolUses,
+                            tools: requestContext.tools,
+                            session: session
+                        ) {
+                        case .stop(let calls):
+                            state.entries.append(.toolCalls(Transcript.ToolCalls(calls)))
+                            continuation.yield(try state.stoppedSnapshot())
+                            continuation.finish()
+                            return
+                        case .invocations(let invocations):
+                            inFlightMessages.append(.init(role: .assistant, content: content))
+                            state.entries.append(.toolCalls(Transcript.ToolCalls(invocations.map(\.call))))
+                            var results: [AnthropicContent] = []
+                            for invocation in invocations {
+                                state.entries.append(.toolOutput(invocation.output))
+                                results.append(
+                                    .toolResult(
+                                        .init(
+                                            toolUseId: invocation.call.id,
+                                            content: convertSegmentsToAnthropicContent(invocation.output.segments)
+                                        )
+                                    )
+                                )
+                            }
+                            inFlightMessages.append(.init(role: .user, content: results))
+                        }
+                        if let snapshot = snapshot() { continuation.yield(snapshot) }
+                        state.beginNextRound()
+                    }
+
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+
+        return LanguageModelSession.ResponseStream(stream: stream)
+    }
+
+    private func buildHeaders() -> [String: String] {
+        var headers: [String: String] = [
+            "x-api-key": tokenProvider(),
+            "anthropic-version": apiVersion,
+        ]
+
+        if let betas = betas, !betas.isEmpty {
+            headers["anthropic-beta"] = betas.joined(separator: ",")
+        }
+
+        return headers
+    }
+}
+
+// MARK: - Conversions
+
+private func createMessageParams(
+    model: String,
+    system: String?,
+    messages: [AnthropicMessage],
+    tools: [AnthropicTool]?,
+    responseSchema: JSONSchema?,
+    options: GenerationOptions
+) throws -> [String: JSONValue] {
+    var params: [String: JSONValue] = [
+        "model": .string(model),
+        "messages": try JSONValue(messages),
+        "max_tokens": .int(options.maximumResponseTokens ?? 1024),
+    ]
+
+    if let system {
+        params["system"] = .string(system)
+    }
+    if let tools, !tools.isEmpty {
+        params["tools"] = try JSONValue(tools)
+    }
+    if let responseSchema {
+        // Structured outputs: https://platform.claude.com/docs/en/build-with-claude/structured-outputs
+        let schemaValue = try JSONValue(responseSchema)
+        if case .object(let schemaObject) = schemaValue, schemaObject.isEmpty {
+            // Anthropic rejects empty schemas; omit output_config in this case.
+        } else {
+            params["output_config"] = .object(
+                [
+                    "format": .object(
+                        [
+                            "type": .string("json_schema"),
+                            "schema": schemaValue,
+                        ]
+                    )
+                ]
+            )
+        }
+    }
+    if let temperature = options.temperature {
+        params["temperature"] = .double(temperature)
+    }
+
+    // Apply Anthropic-specific custom options
+    if let customOptions = options[custom: AnthropicLanguageModel.self] {
+        if let topP = customOptions.topP {
+            params["top_p"] = .double(topP)
+        }
+        if let topK = customOptions.topK {
+            params["top_k"] = .int(topK)
+        }
+        if let stopSequences = customOptions.stopSequences, !stopSequences.isEmpty {
+            params["stop_sequences"] = .array(stopSequences.map { .string($0) })
+        }
+        if let metadata = customOptions.metadata {
+            var metadataObject: [String: JSONValue] = [:]
+            if let userID = metadata.userID {
+                metadataObject["user_id"] = .string(userID)
+            }
+            if !metadataObject.isEmpty {
+                params["metadata"] = .object(metadataObject)
+            }
+        }
+        if let toolChoice = customOptions.toolChoice {
+            switch toolChoice {
+            case .auto:
+                params["tool_choice"] = .object(["type": .string("auto")])
+            case .any:
+                params["tool_choice"] = .object(["type": .string("any")])
+            case .tool(let name):
+                params["tool_choice"] = .object([
+                    "type": .string("tool"),
+                    "name": .string(name),
+                ])
+            case .disabled:
+                params["tool_choice"] = .object(["type": .string("none")])
+            }
+        }
+        if let serviceTier = customOptions.serviceTier {
+            params["service_tier"] = .string(serviceTier.rawValue)
+        }
+        if let effort = customOptions.effort {
+            // Preserve the structured output format when adding effort.
+            var outputConfig = params["output_config"]?.objectValue ?? [:]
+            outputConfig["effort"] = .string(effort.rawValue)
+            params["output_config"] = .object(outputConfig)
+        }
+        if let thinking = customOptions.thinking {
+            params["thinking"] = try JSONValue(thinking)
+        }
+        // Merge custom extraBody into the request
+        if let extraBody = customOptions.extraBody {
+            for (key, value) in extraBody {
+                params[key] = value
+            }
+        }
+    }
+
+    return params
+}
+
+// MARK: - Tool Invocation Handling
+
+private struct ToolInvocationResult {
+    let call: Transcript.ToolCall
+    let output: Transcript.ToolOutput
+}
+
+private enum ToolResolutionOutcome {
+    case stop(calls: [Transcript.ToolCall])
+    case invocations([ToolInvocationResult])
+}
+
+private func emptyResponseContent<Content: Generable>(
+    for type: Content.Type
+) throws -> (content: Content, rawContent: GeneratedContent) {
+    if type == String.self {
+        let raw = GeneratedContent("")
+        return ("" as! Content, raw)
+    }
+
+    let emptyObject = GeneratedContent(properties: [:])
+    if let content = try? Content(emptyObject) {
+        return (content, emptyObject)
+    }
+
+    let nullContent = GeneratedContent(kind: .null)
+    if let content = try? Content(nullContent) {
+        return (content, nullContent)
+    }
+
+    throw GeneratedContentError.typeMismatch
+}
+
+private func partialSnapshot<Content: Generable>(
+    from accumulatedText: String
+) throws -> LanguageModelSession.ResponseStream<Content>.Snapshot {
+    let raw = try GeneratedContent(json: accumulatedText)
+    let content = try Content.PartiallyGenerated(raw)
+    return .init(content: content, rawContent: raw)
+}
+
+private func convertSchemaToAnthropicFormat(_ schema: GenerationSchema) throws -> JSONSchema {
+    try schema.inlinedJSONSchema()
+}
+
+private func resolveToolUses(
+    _ toolUses: [AnthropicToolUse],
+    tools: [any Tool],
+    session: LanguageModelSession
+) async throws -> ToolResolutionOutcome {
+    if toolUses.isEmpty { return .invocations([]) }
+
+    var toolsByName: [String: any Tool] = [:]
+    for tool in tools {
+        if toolsByName[tool.name] == nil {
+            toolsByName[tool.name] = tool
+        }
+    }
+
+    var transcriptCalls: [Transcript.ToolCall] = []
+    transcriptCalls.reserveCapacity(toolUses.count)
+    for use in toolUses {
+        let args = GeneratedContent(.object(use.input ?? [:]))
+        let callID = use.id
+        transcriptCalls.append(
+            Transcript.ToolCall(
+                id: callID,
+                toolName: use.name,
+                arguments: args
+            )
+        )
+    }
+
+    if let delegate = session.toolExecutionDelegate {
+        await delegate.didGenerateToolCalls(transcriptCalls, in: session)
+    }
+
+    guard !transcriptCalls.isEmpty else { return .invocations([]) }
+
+    var decisions: [ToolExecutionDecision] = []
+    decisions.reserveCapacity(transcriptCalls.count)
+
+    if let delegate = session.toolExecutionDelegate {
+        for call in transcriptCalls {
+            let decision = await delegate.toolCallDecision(for: call, in: session)
+            if case .stop = decision {
+                return .stop(calls: transcriptCalls)
+            }
+            decisions.append(decision)
+        }
+    } else {
+        decisions = Array(repeating: .execute, count: transcriptCalls.count)
+    }
+
+    var results: [ToolInvocationResult] = []
+    results.reserveCapacity(transcriptCalls.count)
+
+    for (index, call) in transcriptCalls.enumerated() {
+        switch decisions[index] {
+        case .stop:
+            // This branch should be unreachable because `.stop` returns during decision collection.
+            // Keep it as a defensive guard in case that logic changes.
+            return .stop(calls: transcriptCalls)
+        case .provideOutput(let segments):
+            let output = Transcript.ToolOutput(
+                id: call.id,
+                toolName: call.toolName,
+                segments: segments
+            )
+            if let delegate = session.toolExecutionDelegate {
+                await delegate.didExecuteToolCall(call, output: output, in: session)
+            }
+            results.append(ToolInvocationResult(call: call, output: output))
+        case .execute:
+            guard let tool = toolsByName[call.toolName] else {
+                let message = Transcript.Segment.text(.init(content: "Tool not found: \(call.toolName)"))
+                let output = Transcript.ToolOutput(
+                    id: call.id,
+                    toolName: call.toolName,
+                    segments: [message]
+                )
+                if let delegate = session.toolExecutionDelegate {
+                    await delegate.didExecuteToolCall(call, output: output, in: session)
+                }
+                results.append(ToolInvocationResult(call: call, output: output))
+                continue
+            }
+
+            do {
+                let segments = try await tool.makeOutputSegments(from: call.arguments)
+                let output = Transcript.ToolOutput(
+                    id: call.id,
+                    toolName: tool.name,
+                    segments: segments
+                )
+                if let delegate = session.toolExecutionDelegate {
+                    await delegate.didExecuteToolCall(call, output: output, in: session)
+                }
+                results.append(ToolInvocationResult(call: call, output: output))
+            } catch {
+                if let delegate = session.toolExecutionDelegate {
+                    await delegate.didFailToolCall(call, error: error, in: session)
+                }
+                throw LanguageModelSession.ToolCallError(tool: tool, underlyingError: error)
+            }
+        }
+    }
+
+    return .invocations(results)
+}
+
+// Convert our GenerationSchema into Anthropic's expected JSON Schema payload
+private func convertToolToAnthropicFormat(_ tool: any Tool) throws -> AnthropicTool {
+    let schema = try convertSchemaToAnthropicFormat(tool.parameters)
+    return AnthropicTool(name: tool.name, description: tool.description, inputSchema: schema)
+}
+
+// MARK: - Supporting Types
+
+extension Transcript {
+    fileprivate func toAnthropicMessages() throws -> [AnthropicMessage] {
+        var messages = [AnthropicMessage]()
+        func appendAssistant(_ content: [AnthropicContent]) {
+            if let last = messages.last, last.role == .assistant {
+                messages[messages.count - 1] = .init(role: .assistant, content: last.content + content)
+            } else {
+                messages.append(.init(role: .assistant, content: content))
+            }
+        }
+        for item in self {
+            switch item {
+            case .instructions(let instructions):
+                messages.append(
+                    .init(
+                        role: .user,
+                        content: convertSegmentsToAnthropicContent(instructions.segments)
+                    )
+                )
+            case .prompt(let prompt):
+                messages.append(
+                    .init(
+                        role: .user,
+                        content: convertSegmentsToAnthropicContent(prompt.segments)
+                    )
+                )
+            case .reasoning(let reasoning):
+                guard reasoning.metadata["provider"] == GeneratedContent("anthropic") else {
+                    // Foreign reasoning remains display history, not Anthropic replay state.
+                    continue
+                }
+                guard let data = reasoning.signature, let signature = String(data: data, encoding: .utf8),
+                    !signature.isEmpty
+                else {
+                    throw Transcript.ReasoningReplayError.invalidSignature
+                }
+                if reasoning.metadata["isRedacted"] == GeneratedContent(true) {
+                    appendAssistant([.redactedThinking(.init(data: signature))])
+                    continue
+                }
+                let text = try reasoning.segments.map { segment -> String in
+                    guard case .text(let text) = segment else {
+                        throw Transcript.ReasoningReplayError.unsupportedSegment
+                    }
+                    return text.content
+                }.joined()
+                appendAssistant([.thinking(.init(thinking: text, signature: signature))])
+            case .response(let response):
+                // Anthropic rejects text blocks without non-whitespace text,
+                // such as the empty response of a turn that only called tools.
+                let content = convertSegmentsToAnthropicContent(response.segments).filter { block in
+                    guard case .text(let text) = block else { return true }
+                    return !text.text.allSatisfy(\.isWhitespace)
+                }
+                guard !content.isEmpty else { continue }
+                appendAssistant(content)
+            case .toolCalls(let toolCalls):
+                // Add assistant message with tool use blocks
+                let toolUseBlocks: [AnthropicContent] = toolCalls.map { call in
+                    let input = call.arguments.jsonValue.objectValue ?? [:]
+                    return .toolUse(
+                        AnthropicToolUse(
+                            id: call.id,
+                            name: call.toolName,
+                            input: input
+                        )
+                    )
+                }
+                appendAssistant(toolUseBlocks)
+            case .toolOutput(let toolOutput):
+                // Add user message with tool result
+                messages.append(
+                    .init(
+                        role: .user,
+                        content: [
+                            .toolResult(
+                                AnthropicToolResult(
+                                    toolUseId: toolOutput.id,
+                                    content: convertSegmentsToAnthropicContent(toolOutput.segments)
+                                )
+                            )
+                        ]
+                    )
+                )
+            }
+        }
+        return messages
+    }
+}
+
+private struct AnthropicTool: Codable, Sendable {
+    let name: String
+    let description: String
+    let inputSchema: JSONSchema
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case description
+        case inputSchema = "input_schema"
+    }
+}
+
+private struct AnthropicMessage: Codable, Sendable {
+    enum Role: String, Codable, Sendable { case user, assistant }
+
+    let role: Role
+    let content: [AnthropicContent]
+}
+
+private enum AnthropicContent: Codable, Sendable {
+    case text(AnthropicText)
+    case image(AnthropicImage)
+    case toolUse(AnthropicToolUse)
+    case toolResult(AnthropicToolResult)
+    case thinking(AnthropicThinking)
+    case redactedThinking(AnthropicRedactedThinking)
+
+    enum CodingKeys: String, CodingKey { case type }
+
+    enum ContentType: String, Codable {
+        case text = "text", image = "image", toolUse = "tool_use", toolResult = "tool_result", thinking = "thinking",
+            redactedThinking = "redacted_thinking"
+    }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try container.decode(ContentType.self, forKey: .type)
+        switch type {
+        case .text:
+            self = .text(try AnthropicText(from: decoder))
+        case .image:
+            self = .image(try AnthropicImage(from: decoder))
+        case .toolUse:
+            self = .toolUse(try AnthropicToolUse(from: decoder))
+        case .toolResult:
+            self = .toolResult(try AnthropicToolResult(from: decoder))
+        case .thinking:
+            self = .thinking(try AnthropicThinking(from: decoder))
+        case .redactedThinking:
+            self = .redactedThinking(try AnthropicRedactedThinking(from: decoder))
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        switch self {
+        case .text(let t): try t.encode(to: encoder)
+        case .image(let i): try i.encode(to: encoder)
+        case .toolUse(let u): try u.encode(to: encoder)
+        case .toolResult(let r): try r.encode(to: encoder)
+        case .thinking(let h): try h.encode(to: encoder)
+        case .redactedThinking(let value): try value.encode(to: encoder)
+        }
+    }
+}
+
+private struct AnthropicRedactedThinking: Codable, Sendable {
+    let type: String
+    let data: String
+    init(data: String) { self.type = "redacted_thinking"; self.data = data }
+    func transcriptReasoning(id: String = UUID().uuidString) -> Transcript.Reasoning {
+        .init(
+            id: id,
+            metadata: ["provider": GeneratedContent("anthropic"), "isRedacted": GeneratedContent(true)],
+            segments: [],
+            signature: Data(data.utf8)
+        )
+    }
+}
+
+private struct AnthropicThinking: Codable, Sendable {
+    let type: String
+    let thinking: String
+    let signature: String
+
+    init(thinking: String, signature: String) {
+        self.type = "thinking"
+        self.thinking = thinking
+        self.signature = signature
+    }
+}
+
+private struct AnthropicText: Codable, Sendable {
+    let type: String
+    let text: String
+
+    init(text: String) {
+        self.type = "text"
+        self.text = text
+    }
+}
+
+private struct AnthropicImage: Codable, Sendable {
+    struct Source: Codable, Sendable {
+        let type: String
+        let mediaType: String?
+        let data: String?
+        let url: String?
+
+        enum CodingKeys: String, CodingKey {
+            case type
+            case mediaType = "media_type"
+            case data
+            case url
+        }
+    }
+
+    let type: String
+    let source: Source
+
+    init(base64Data: String, mimeType: String) {
+        self.type = "image"
+        self.source = Source(type: "base64", mediaType: mimeType, data: base64Data, url: nil)
+    }
+
+    init(url: String) {
+        self.type = "image"
+        self.source = Source(type: "url", mediaType: nil, data: nil, url: url)
+    }
+}
+
+private extension AnthropicThinking {
+    func transcriptReasoning(id: String = UUID().uuidString) -> Transcript.Reasoning {
+        .init(
+            id: id,
+            metadata: ["provider": GeneratedContent("anthropic")],
+            segments: [.text(.init(id: id + ":text", content: thinking))],
+            signature: signature.isEmpty ? nil : Data(signature.utf8)
+        )
+    }
+}
+
+private func convertSegmentsToAnthropicContent(_ segments: [Transcript.Segment]) -> [AnthropicContent] {
+    var blocks: [AnthropicContent] = []
+    blocks.reserveCapacity(segments.count)
+    for segment in segments {
+        switch segment {
+        case .text(let t):
+            blocks.append(.text(AnthropicText(text: t.content)))
+        case .structure(let s):
+            blocks.append(.text(AnthropicText(text: s.content.jsonString)))
+        case .image(let img):
+            switch img.source {
+            case .url(let url):
+                blocks.append(.image(AnthropicImage(url: url.absoluteString)))
+            case .data(let data, let mimeType):
+                blocks.append(.image(AnthropicImage(base64Data: data.base64EncodedString(), mimeType: mimeType)))
+            }
+        }
+    }
+    return blocks
+}
+
+private struct AnthropicToolUse: Codable, Sendable {
+    let type: String
+    let id: String
+    let name: String
+    let input: [String: JSONValue]?
+
+    init(id: String, name: String, input: [String: JSONValue]?) {
+        self.type = "tool_use"
+        self.id = id
+        self.name = name
+        self.input = input
+    }
+}
+
+private struct AnthropicToolResult: Codable, Sendable {
+    let type: String
+    let toolUseId: String
+    let content: [AnthropicContent]
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case toolUseId = "tool_use_id"
+        case content
+    }
+
+    init(toolUseId: String, content: [AnthropicContent]) {
+        self.type = "tool_result"
+        self.toolUseId = toolUseId
+        self.content = content
+    }
+}
+
+private struct AnthropicMessageResponse: Codable, Sendable {
+    let id: String
+    let type: String
+    let role: String
+    let content: [AnthropicContent]
+    let model: String
+    let stopReason: StopReason?
+    let usage: AnthropicUsage?
+
+    enum CodingKeys: String, CodingKey {
+        case id, type, role, content, model, usage
+        case stopReason = "stop_reason"
+    }
+
+    enum StopReason: String, Codable {
+        case endTurn = "end_turn"
+        case maxTokens = "max_tokens"
+        case stopSequence = "stop_sequence"
+        case toolUse = "tool_use"
+        case pauseTurn = "pause_turn"
+        case refusal = "refusal"
+        case modelContextWindowExceeded = "model_context_window_exceeded"
+    }
+}
+
+private struct AnthropicErrorResponse: Codable { let error: AnthropicErrorDetail }
+private struct AnthropicErrorDetail: Codable {
+    let type: String
+    let message: String
+}
+
+// MARK: - Streaming Event Types
+
+private struct AnthropicStreamBlock {
+    let reasoningID = UUID().uuidString
+    var reasoningEntry: Transcript.Reasoning? {
+        if start.type == "redacted_thinking", let data = start.data {
+            return AnthropicRedactedThinking(data: data).transcriptReasoning(id: reasoningID)
+        }
+        guard start.type == "thinking" else { return nil }
+        return AnthropicThinking(thinking: thinking, signature: signature).transcriptReasoning(id: reasoningID)
+    }
+    let start: AnthropicStreamEvent.ContentBlockStartEvent.ContentBlock
+    var text: String
+    var arguments = ""
+    var thinking: String
+    var signature: String
+
+    init(_ start: AnthropicStreamEvent.ContentBlockStartEvent.ContentBlock) {
+        self.start = start
+        text = start.text ?? ""
+        thinking = start.thinking ?? ""
+        signature = start.signature ?? ""
+    }
+
+    func content() throws -> AnthropicContent? {
+        switch start.type {
+        case "text": return .text(.init(text: text))
+        case "thinking": return .thinking(.init(thinking: thinking, signature: signature))
+        case "redacted_thinking":
+            guard let data = start.data else { throw Transcript.ReasoningReplayError.invalidSignature }
+            return .redactedThinking(.init(data: data))
+        case "tool_use":
+            guard let id = start.id, let name = start.name else { return nil }
+            let input =
+                arguments.isEmpty
+                ? start.input
+                : try JSONDecoder().decode([String: JSONValue].self, from: Data(arguments.utf8))
+            return .toolUse(.init(id: id, name: name, input: input))
+        default: return nil
+        }
+    }
+}
+
+private enum AnthropicStreamEvent: Codable, Sendable {
+    case messageStart(MessageStartEvent)
+    case contentBlockStart(ContentBlockStartEvent)
+    case contentBlockDelta(ContentBlockDeltaEvent)
+    case contentBlockStop(ContentBlockStopEvent)
+    case messageDelta(MessageDeltaEvent)
+    case messageStop
+    case ping
+    case ignored
+
+    enum CodingKeys: String, CodingKey { case type }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let type = try container.decode(String.self, forKey: .type)
+
+        switch type {
+        case "message_start":
+            self = .messageStart(try MessageStartEvent(from: decoder))
+        case "content_block_start":
+            self = .contentBlockStart(try ContentBlockStartEvent(from: decoder))
+        case "content_block_delta":
+            self = .contentBlockDelta(try ContentBlockDeltaEvent(from: decoder))
+        case "content_block_stop":
+            self = .contentBlockStop(try ContentBlockStopEvent(from: decoder))
+        case "message_delta":
+            self = .messageDelta(try MessageDeltaEvent(from: decoder))
+        case "message_stop":
+            self = .messageStop
+        case "ping":
+            self = .ping
+        default:
+            self = .ignored
+        }
+    }
+
+    func encode(to encoder: any Encoder) throws {
+        switch self {
+        case .messageStart(let event): try event.encode(to: encoder)
+        case .contentBlockStart(let event): try event.encode(to: encoder)
+        case .contentBlockDelta(let event): try event.encode(to: encoder)
+        case .contentBlockStop(let event): try event.encode(to: encoder)
+        case .messageDelta(let event): try event.encode(to: encoder)
+        case .messageStop:
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode("message_stop", forKey: .type)
+        case .ping:
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode("ping", forKey: .type)
+        case .ignored:
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode("ignored", forKey: .type)
+        }
+    }
+
+    struct MessageStartEvent: Codable, Sendable {
+        let type: String
+        let message: AnthropicMessageResponse
+    }
+
+    struct ContentBlockStartEvent: Codable, Sendable {
+        let type: String
+        let index: Int
+        let contentBlock: ContentBlock
+
+        enum CodingKeys: String, CodingKey {
+            case type, index
+            case contentBlock = "content_block"
+        }
+
+        struct ContentBlock: Codable, Sendable {
+            let type: String
+            let text: String?
+            let id: String?
+            let name: String?
+            let input: [String: JSONValue]?
+            let thinking: String?
+            let signature: String?
+            let data: String?
+        }
+    }
+
+    struct ContentBlockDeltaEvent: Codable, Sendable {
+        let type: String
+        let index: Int
+        let delta: Delta
+
+        enum Delta: Codable, Sendable {
+            case textDelta(TextDelta)
+            case inputJsonDelta(InputJsonDelta)
+            case thinkingDelta(ThinkingDelta)
+            case signatureDelta(SignatureDelta)
+            case ignored
+
+            enum CodingKeys: String, CodingKey { case type }
+
+            init(from decoder: any Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                let type = try container.decode(String.self, forKey: .type)
+
+                switch type {
+                case "text_delta":
+                    self = .textDelta(try TextDelta(from: decoder))
+                case "input_json_delta":
+                    self = .inputJsonDelta(try InputJsonDelta(from: decoder))
+                case "thinking_delta":
+                    self = .thinkingDelta(try ThinkingDelta(from: decoder))
+                case "signature_delta":
+                    self = .signatureDelta(try SignatureDelta(from: decoder))
+                default:
+                    self = .ignored
+                }
+            }
+
+            func encode(to encoder: any Encoder) throws {
+                switch self {
+                case .textDelta(let delta): try delta.encode(to: encoder)
+                case .inputJsonDelta(let delta): try delta.encode(to: encoder)
+                case .ignored:
+                    var container = encoder.container(keyedBy: CodingKeys.self)
+                    try container.encode("ignored", forKey: .type)
+                case .thinkingDelta(let delta): try delta.encode(to: encoder)
+                case .signatureDelta(let delta): try delta.encode(to: encoder)
+                }
+            }
+
+            struct TextDelta: Codable, Sendable {
+                let type: String
+                let text: String
+            }
+
+            struct InputJsonDelta: Codable, Sendable {
+                let type: String
+                let partialJson: String
+
+                enum CodingKeys: String, CodingKey {
+                    case type
+                    case partialJson = "partial_json"
+                }
+            }
+
+            struct ThinkingDelta: Codable, Sendable {
+                let type: String
+                let thinking: String
+            }
+
+            /// Cryptographic signature for a completed thinking block.
+            struct SignatureDelta: Codable, Sendable {
+                let type: String
+                let signature: String
+            }
+        }
+    }
+
+    struct ContentBlockStopEvent: Codable, Sendable {
+        let type: String
+        let index: Int
+    }
+
+    struct MessageDeltaEvent: Codable, Sendable {
+        let usage: AnthropicUsage?
+        let type: String
+        let delta: Delta
+
+        struct Delta: Codable, Sendable {
+            let stopReason: String?
+            let stopSequence: String?
+
+            enum CodingKeys: String, CodingKey {
+                case stopReason = "stop_reason"
+                case stopSequence = "stop_sequence"
+            }
+        }
+    }
+}
+
+private struct AnthropicUsage: Codable, Sendable {
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let cacheReadInputTokens: Int?
+    let cacheCreationInputTokens: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case cacheReadInputTokens = "cache_read_input_tokens"
+        case cacheCreationInputTokens = "cache_creation_input_tokens"
+    }
+
+    var reportedUsage: ReportedUsage? {
+        // Anthropic reports uncached input, cache reads, and cache writes separately.
+        let inputCounts = [inputTokens, cacheReadInputTokens, cacheCreationInputTokens].compactMap { $0 }
+        var metadata: [String: GeneratedContent] = [:]
+        if let cacheCreationInputTokens {
+            metadata["cache_creation_input_tokens"] = GeneratedContent(cacheCreationInputTokens)
+        }
+        return ReportedUsage(
+            input: .init(
+                totalTokenCount: inputCounts.isEmpty ? nil : inputCounts.reduce(0, +),
+                cachedTokenCount: cacheReadInputTokens
+            ),
+            output: .init(totalTokenCount: outputTokens),
+            metadata: metadata
+        ).normalized
+    }
+}
+
+extension AnthropicToolUse {
+    var roundCall: ToolRoundLimit.Call {
+        .init(name: name, arguments: input)
+    }
+}

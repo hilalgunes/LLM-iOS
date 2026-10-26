@@ -23,7 +23,7 @@ final class ModelCacheManager {
     private let cache = HubCache.default
 
     init() {
-        models = LocalModelChoice.allCases.map {
+        models = LocalModelChoice.allCases.filter { $0 != .apple }.map {
             ManagedModel(id: $0.repositoryID, title: $0.title, category: "Sohbet")
         } + RAGEmbeddingChoice.allCases.map {
             ManagedModel(id: $0.repositoryID, title: $0.title, category: "Embedding")

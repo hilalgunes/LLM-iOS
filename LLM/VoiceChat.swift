@@ -2,6 +2,21 @@ import AVFoundation
 import Observation
 import Speech
 
+enum SpeechEngine: String, CaseIterable, Identifiable {
+    case system
+    case ema
+    case mlxAudio
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .system: "iOS sesi (Türkçe)"
+        case .ema: "EMA (Türkçe)"
+        case .mlxAudio: "MLX Audio · OmniVoice (Türkçe)"
+        }
+    }
+}
+
 @Observable
 @MainActor
 final class VoiceChatController: NSObject, AVAudioPlayerDelegate {
@@ -12,24 +27,46 @@ final class VoiceChatController: NSObject, AVAudioPlayerDelegate {
     var speaksReplies = UserDefaults.standard.bool(forKey: "voice.speaksReplies") {
         didSet {
             UserDefaults.standard.set(speaksReplies, forKey: "voice.speaksReplies")
+            if !speaksReplies { stopSpeaking() }
         }
     }
-    var usesEMASpeech = UserDefaults.standard.bool(forKey: "voice.usesEMASpeech") {
+    var speechEngine: SpeechEngine = {
+        if let saved = UserDefaults.standard.string(forKey: "voice.speechEngine"),
+           let engine = SpeechEngine(rawValue: saved) {
+            return engine
+        }
+        return UserDefaults.standard.bool(forKey: "voice.usesEMASpeech") ? .ema : .system
+    }() {
         didSet {
-            UserDefaults.standard.set(usesEMASpeech, forKey: "voice.usesEMASpeech")
+            UserDefaults.standard.set(speechEngine.rawValue, forKey: "voice.speechEngine")
+            if oldValue != speechEngine { stopSpeaking() }
         }
     }
+    var usesEMASpeech: Bool { speechEngine == .ema }
+    var usesLocalSpeechModel: Bool { speechEngine != .system }
+    var speechPreparationMessage: String {
+        if speechEngine == .mlxAudio {
+            if let audioDownloadProgress {
+                return "OmniVoice indiriliyor: %\(Int(audioDownloadProgress * 100)) — ilk kullanımda uzun sürebilir."
+            }
+            return "OmniVoice sesi hazırlanıyor…"
+        }
+        return "Türkçe ses hazırlanıyor; EMA ilk kullanımda model dosyalarını indirir…"
+    }
+    private(set) var audioDownloadProgress: Double?
     var isGeneratingSpeech = false
 
     private let audioEngine = AVAudioEngine()
     private let synthesizer = AVSpeechSynthesizer()
     private var emaSpeechPlayer: AVAudioPlayer?
     private let emaSpeech = EMAOnnxSpeech.shared
+    private let mlxSpeech = MLXAudioSpeech.shared
     private var speechChunks: [String] = []
     private var pendingSpeechText = ""
     private var shouldSpeakCurrentReply = false
     private var isDrainingEMAQueue = false
     private var speechGeneration = UUID()
+    private var speechTask: Task<Void, Never>?
     private var emaPlaybackContinuation: CheckedContinuation<Void, Error>?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
     private var recognitionTask: SFSpeechRecognitionTask?
@@ -43,6 +80,7 @@ final class VoiceChatController: NSObject, AVAudioPlayerDelegate {
 
     func startRecording() async {
         guard !isRecording, !isFinishingRecognition else { return }
+        stopSpeaking()
         errorMessage = nil
 
         do {
@@ -148,7 +186,22 @@ final class VoiceChatController: NSObject, AVAudioPlayerDelegate {
         finishStreamingReply()
     }
 
+    func stopSpeaking() {
+        speechTask?.cancel()
+        speechGeneration = UUID()
+        shouldSpeakCurrentReply = false
+        pendingSpeechText = ""
+        speechChunks.removeAll()
+        synthesizer.stopSpeaking(at: .immediate)
+        stopEMAPlayback()
+        isDrainingEMAQueue = false
+        isGeneratingSpeech = false
+        audioDownloadProgress = nil
+    }
+
     func beginStreamingReply() {
+        errorMessage = nil
+        speechTask?.cancel()
         speechGeneration = UUID()
         synthesizer.stopSpeaking(at: .immediate)
         stopEMAPlayback()
@@ -157,6 +210,11 @@ final class VoiceChatController: NSObject, AVAudioPlayerDelegate {
         isDrainingEMAQueue = false
         isGeneratingSpeech = false
         shouldSpeakCurrentReply = speaksReplies
+    }
+
+    func waitForSpeechCompletion() async {
+        await speechTask?.value
+        await mlxSpeech.unload()
     }
 
     func appendReplyText(_ token: String) {
@@ -168,7 +226,7 @@ final class VoiceChatController: NSObject, AVAudioPlayerDelegate {
             let chunk = String(pendingSpeechText[..<endIndex]).trimmingCharacters(in: .whitespacesAndNewlines)
             pendingSpeechText = String(pendingSpeechText[endIndex...])
             guard !chunk.isEmpty else { continue }
-            enqueueSpeech(chunk, startImmediately: !usesEMASpeech)
+            enqueueSpeech(chunk, startImmediately: true)
         }
     }
 
@@ -177,12 +235,13 @@ final class VoiceChatController: NSObject, AVAudioPlayerDelegate {
         if success {
             let remaining = pendingSpeechText.trimmingCharacters(in: .whitespacesAndNewlines)
             if !remaining.isEmpty {
-                enqueueSpeech(remaining, startImmediately: !usesEMASpeech)
+                enqueueSpeech(remaining, startImmediately: true)
             }
-            if usesEMASpeech, !speechChunks.isEmpty {
+            if usesLocalSpeechModel, !speechChunks.isEmpty {
                 startSpeechQueue()
             }
         } else {
+            speechTask?.cancel()
             speechGeneration = UUID()
             speechChunks.removeAll()
             pendingSpeechText = ""
@@ -202,7 +261,15 @@ final class VoiceChatController: NSObject, AVAudioPlayerDelegate {
     }
 
     private func enqueueSpeech(_ text: String, startImmediately: Bool) {
-        guard usesEMASpeech else {
+        guard usesLocalSpeechModel else {
+            do {
+                try preparePlayback()
+            } catch {
+                shouldSpeakCurrentReply = false
+                pendingSpeechText = ""
+                errorMessage = SpeechFailure.describe(error, stage: "iOS sesi: ses çıkışı başlatılamadı.")
+                return
+            }
             let utterance = AVSpeechUtterance(string: text)
             utterance.voice = AVSpeechSynthesisVoice(language: "tr-TR")
             utterance.rate = AVSpeechUtteranceDefaultSpeechRate
@@ -220,32 +287,49 @@ final class VoiceChatController: NSObject, AVAudioPlayerDelegate {
         isDrainingEMAQueue = true
         isGeneratingSpeech = true
         let currentGeneration = speechGeneration
-        Task {
+        let engine = speechEngine
+        let previousTask = speechTask
+        speechTask = Task {
+            await previousTask?.value
             while speechGeneration == currentGeneration, !speechChunks.isEmpty {
                 let nextChunk = speechChunks.removeFirst()
+                var stage = "model yükleme / ses üretimi"
                 do {
-                    let waveFile = try await emaSpeech.synthesize(nextChunk)
+                    let waveFile: Data
+                    if engine == .mlxAudio {
+                        waveFile = try await mlxSpeech.synthesize(nextChunk) { [weak self] progress in
+                            guard let self, self.speechGeneration == currentGeneration else { return }
+                            self.audioDownloadProgress = progress.map { min(max($0, 0), 1) }
+                        }
+                    } else {
+                        waveFile = try await emaSpeech.synthesize(nextChunk)
+                    }
                     guard speechGeneration == currentGeneration else { break }
+                    stage = "ses dosyasını oynatma"
                     try await playEMA(waveFile)
                 } catch is CancellationError {
                     break
                 } catch {
                     if speechGeneration == currentGeneration {
-                        errorMessage = error.localizedDescription
+                        speechChunks.removeAll()
+                        shouldSpeakCurrentReply = false
+                        pendingSpeechText = ""
+                        errorMessage = SpeechFailure.describe(error, stage: "\(engine.title): \(stage) başarısız.")
                     }
+                    break
                 }
             }
             if speechGeneration == currentGeneration {
                 isDrainingEMAQueue = false
                 isGeneratingSpeech = false
+                audioDownloadProgress = nil
+                speechTask = nil
             }
         }
     }
 
     private func playEMA(_ waveFile: Data) async throws {
-        let audioSession = AVAudioSession.sharedInstance()
-        try audioSession.setCategory(.playback, mode: .spokenAudio, options: .duckOthers)
-        try audioSession.setActive(true)
+        try preparePlayback()
         let player = try AVAudioPlayer(data: waveFile)
         player.delegate = self
         player.prepareToPlay()
@@ -261,6 +345,7 @@ final class VoiceChatController: NSObject, AVAudioPlayerDelegate {
     }
 
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        guard player === emaSpeechPlayer else { return }
         guard let continuation = emaPlaybackContinuation else { return }
         emaPlaybackContinuation = nil
         if flag {
@@ -271,9 +356,20 @@ final class VoiceChatController: NSObject, AVAudioPlayerDelegate {
     }
 
     func audioPlayerDecodeErrorDidOccur(_ player: AVAudioPlayer, error: Error?) {
+        guard player === emaSpeechPlayer else { return }
         guard let continuation = emaPlaybackContinuation else { return }
         emaPlaybackContinuation = nil
         continuation.resume(throwing: error ?? VoiceChatError.audioPlaybackFailed)
+    }
+
+    private func preparePlayback() throws {
+        let session = AVAudioSession.sharedInstance()
+        // Reset the recording mode/options before activating output. Configure once
+        // per route, rather than reconfiguring it for each streamed sentence.
+        if session.category != .playback || session.mode != .default || !session.categoryOptions.isEmpty {
+            try session.setCategory(.playback, mode: .default, options: [])
+        }
+        try session.setActive(true)
     }
 
     private func requestPermissions() async throws {

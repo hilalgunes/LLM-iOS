@@ -1,0 +1,2373 @@
+import Foundation
+
+#if canImport(UIKit) && canImport(CoreImage)
+    import UIKit
+    import CoreImage
+#endif
+
+#if canImport(AppKit) && canImport(CoreImage)
+    import AppKit
+    import CoreImage
+#endif
+
+#if MLX
+    import JSONSchema
+    import MLXLMCommon
+    import MLX
+    import MLXLLM
+    import MLXVLM
+    import MLXHuggingFace
+    import HuggingFace
+    import Tokenizers
+
+    /// Keeps vocabulary-derived tokens alive with the loaded model and tokenizer.
+    private struct LoadedModelContext {
+        let context: ModelContext
+        let tokenCache = StructuredGenerationTokenCache()
+    }
+
+    /// Wrapper to store model availability state in NSCache.
+    private final class CachedModelState: NSObject, @unchecked Sendable {
+        enum Value {
+            case loaded(LoadedModelContext)
+            case failed(String)
+        }
+
+        let value: Value
+
+        init(_ value: Value) {
+            self.value = value
+        }
+    }
+
+    /// Coordinates a bounded in-memory cache with structured, coalesced loading.
+    private final class ModelContextCache {
+        private let cache: NSCache<NSString, CachedModelState>
+        private let inFlight = Locked<[String: Task<CachedModelState, Error>]>([:])
+
+        /// Creates a cache with a count-based eviction limit.
+        init(countLimit: Int) {
+            let cache = NSCache<NSString, CachedModelState>()
+            cache.countLimit = countLimit
+            self.cache = cache
+        }
+
+        /// Returns a cached context or loads it exactly once per key.
+        func context(
+            for key: String,
+            loader: @escaping @Sendable () async throws -> ModelContext
+        ) async throws -> LoadedModelContext {
+            let cacheKey = key as NSString
+            if let cached = cache.object(forKey: cacheKey),
+                case .loaded(let context) = cached.value
+            {
+                return context
+            }
+
+            if let task = inFlightTask(for: key) {
+                let cached = try await task.value
+                if case .loaded(let context) = cached.value {
+                    return context
+                }
+                throw CancellationError()
+            }
+
+            let task = Task {
+                let context = try await loader()
+                return CachedModelState(.loaded(LoadedModelContext(context: context)))
+            }
+            setInFlight(task, for: key)
+
+            do {
+                let cached = try await task.value
+                cache.setObject(cached, forKey: cacheKey)
+                clearInFlight(for: key)
+                if case .loaded(let context) = cached.value {
+                    return context
+                }
+                throw CancellationError()
+            } catch {
+                // Don't treat cancellations as load failures.
+                if error is CancellationError || Task.isCancelled {
+                    cache.removeObject(forKey: cacheKey)
+                    clearInFlight(for: key)
+                    throw error
+                }
+                cache.setObject(
+                    CachedModelState(.failed(String(reflecting: error))),
+                    forKey: cacheKey
+                )
+                clearInFlight(for: key)
+                throw error
+            }
+        }
+
+        /// Removes a cached context for the key.
+        func remove(for key: String) {
+            cache.removeObject(forKey: key as NSString)
+        }
+
+        /// Clears all cached contexts.
+        func removeAll() {
+            cache.removeAllObjects()
+        }
+
+        /// Returns whether a cached context exists for the key.
+        func contains(_ key: String) -> Bool {
+            guard let cached = cache.object(forKey: key as NSString) else {
+                return false
+            }
+            if case .loaded = cached.value {
+                return true
+            }
+            return false
+        }
+
+        /// Returns a description of the most recent load failure for the key.
+        func failureDescription(for key: String) -> String? {
+            guard let cached = cache.object(forKey: key as NSString) else {
+                return nil
+            }
+            if case .failed(let description) = cached.value {
+                return description
+            }
+            return nil
+        }
+
+        /// Cancels in-flight work and removes cached data for the key.
+        func removeAndCancel(for key: String) async {
+            let task = removeInFlight(for: key)
+            task?.cancel()
+            cache.removeObject(forKey: key as NSString)
+        }
+
+        /// Cancels all in-flight work and clears cached data.
+        func removeAllAndCancel() async {
+            let tasks = removeAllInFlight()
+            tasks.forEach { $0.cancel() }
+            cache.removeAllObjects()
+        }
+
+        private func inFlightTask(for key: String) -> Task<CachedModelState, Error>? {
+            inFlight.withLock { $0[key] }
+        }
+
+        private func setInFlight(_ task: Task<CachedModelState, Error>, for key: String) {
+            inFlight.withLock { $0[key] = task }
+        }
+
+        private func clearInFlight(for key: String) {
+            inFlight.withLock { $0[key] = nil }
+        }
+
+        private func removeInFlight(for key: String) -> Task<CachedModelState, Error>? {
+            inFlight.withLock {
+                let task = $0[key]
+                $0[key] = nil
+                return task
+            }
+        }
+
+        private func removeAllInFlight() -> [Task<CachedModelState, Error>] {
+            inFlight.withLock {
+                let tasks = Array($0.values)
+                $0.removeAll()
+                return tasks
+            }
+        }
+    }
+
+    /// Shared cache across MLXLanguageModel instances.
+    private nonisolated(unsafe) let modelCache = ModelContextCache(countLimit: 3)
+
+    // MARK: - MLXLanguageModel
+
+    /// A language model that runs locally using MLX.
+    ///
+    /// Use this model to run language models on Apple silicon using the MLX framework.
+    /// Models are automatically downloaded and cached when first used.
+    ///
+    /// ```swift
+    /// let model = MLXLanguageModel(modelId: "mlx-community/Llama-3.2-3B-Instruct-4bit")
+    /// ```
+    public struct MLXLanguageModel: LanguageModel {
+        /// The reason the model is unavailable.
+        public enum UnavailableReason: Sendable, Equatable, Hashable {
+            /// The model has not been loaded into memory yet.
+            case notLoaded
+            /// The model failed to load and includes the underlying error details.
+            case failedToLoad(String)
+        }
+
+        /// Configures MLX-specific generation behavior.
+        ///
+        /// Set these values through
+        /// `GenerationOptions[custom: MLXLanguageModel.self]`,
+        /// an AnyLanguageModel extension.
+        public struct CustomGenerationOptions: AnyLanguageModel.CustomGenerationOptions, Codable {
+            /// Configures KV-cache behavior for MLX generation.
+            public struct KVCache: Codable, Equatable, Sendable {
+                /// Limits how many tokens the KV cache retains.
+                ///
+                /// Set this to `nil` to use the backend default.
+                public var maxSize: Int?
+
+                /// Sets the KV-cache quantization bit width.
+                ///
+                /// Set this to `nil` to disable KV quantization.
+                public var bits: Int?
+
+                /// Sets the token group size used for KV quantization.
+                public var groupSize: Int
+
+                /// Sets the token offset where quantized KV storage starts.
+                public var quantizedStart: Int
+
+                /// Default KV-cache options used when none are provided at runtime.
+                /// By default, the token group size is 64 and the quantized start is 0.
+                public static var `default`: Self {
+                    .init(
+                        maxSize: nil,
+                        bits: nil,
+                        groupSize: 64,
+                        quantizedStart: 0
+                    )
+                }
+
+                /// Creates KV-cache configuration for MLX generation.
+                ///
+                /// - Parameters:
+                ///   - maxSize: The maximum number of tokens to retain in KV cache storage.
+                ///     Pass `nil` to use the backend default.
+                ///   - bits: The KV-cache quantization bit width.
+                ///     Pass `nil` to disable KV quantization.
+                ///   - groupSize: The token group size used for KV quantization.
+                ///   - quantizedStart: The token index where quantized KV storage begins.
+                public init(
+                    maxSize: Int?,
+                    bits: Int?,
+                    groupSize: Int,
+                    quantizedStart: Int
+                ) {
+                    self.maxSize = maxSize
+                    self.bits = bits
+                    self.groupSize = groupSize
+                    self.quantizedStart = quantizedStart
+                }
+            }
+            /// KV-cache configuration used for generation.
+            public var kvCache: KVCache
+
+            /// Configures media preprocessing applied before model input.
+            public struct UserInputProcessing: Codable, Equatable, Sendable {
+                /// Optional resize target applied to media before tokenization.
+                public var resize: CGSize?
+
+                /// Creates user-input processing configuration.
+                ///
+                /// - Parameter resize: Optional target size for media resizing.
+                init(resize: CGSize?) {
+                    self.resize = resize
+                }
+
+                /// Creates processing that resizes media to a fixed size.
+                ///
+                /// - Parameter size: Target size used for resizing media inputs.
+                public static func resize(to size: CGSize) -> Self {
+                    .init(resize: size)
+                }
+
+                var mlxValue: MLXLMCommon.UserInput.Processing {
+                    .init(resize: resize)
+                }
+            }
+            /// Processing to apply to user media before input preparation.
+            public var userInputProcessing: UserInputProcessing?
+
+            var processingForUserInput: MLXLMCommon.UserInput.Processing {
+                userInputProcessing?.mlxValue
+                    ?? .init(resize: nil)
+            }
+
+            /// Additional key-value pairs injected into the chat template rendering context.
+            public var additionalContext: [String: AnyLanguageModel.JSONValue]?
+
+            var additionalContextForUserInput: [String: any Sendable]? {
+                additionalContext?.mapValues { $0.toSendable() }
+            }
+
+            /// Top-p (nucleus) sampling threshold.
+            ///
+            /// A non-`nil` value overrides nucleus sampling from `GenerationOptions.sampling`.
+            /// When this is `nil`, the nucleus sampling threshold is used if provided. If neither
+            /// supplies a threshold, regular generation uses `1.0` and structured generation uses `0.95`.
+            /// Set this to `1.0` to disable top-p sampling explicitly.
+            public var topP: Float?
+
+            /// Top-k sampling: restricts sampling to the `k` most likely tokens.
+            ///
+            /// A positive value restricts sampling to that many tokens. A non-`nil` value overrides
+            /// top-k sampling from `GenerationOptions.sampling`. When this is `nil`, the top-k count
+            /// is inherited if provided; if neither supplies a count, top-k sampling is disabled.
+            /// Set this to `0` to disable top-k sampling explicitly.
+            public var topK: Int?
+
+            /// Min-p sampling threshold, relative to the most likely token's probability.
+            ///
+            /// Set this to `nil` or `0` to disable min-p sampling.
+            public var minP: Float?
+
+            /// Penalty factor applied to recently generated tokens to reduce repetition.
+            ///
+            /// Set this to `nil` to use no penalty for regular generation or `1.1` for
+            /// structured generation. Set this to `1.0` to neutralize the penalty explicitly.
+            public var repetitionPenalty: Float?
+
+            /// Number of recent tokens considered by the repetition penalty.
+            ///
+            /// Set this to `nil` to use `20` for regular generation or `64` for structured generation.
+            public var repetitionContextSize: Int?
+
+            /// Creates MLX-specific generation options.
+            ///
+            /// - Parameters:
+            ///   - kvCache: KV-cache configuration used for generation.
+            ///   - additionalContext: Additional key-value pairs injected into the chat
+            ///     template rendering context.
+            ///   - userInputProcessing: Processing to apply to user media before input preparation.
+            ///     Defaults to `nil`, which lets MLX use its default media handling.
+            ///   - topP: Top-p (nucleus) sampling override. Defaults to `nil`, which inherits the
+            ///     core nucleus threshold if provided. When neither supplies a threshold, regular
+            ///     generation uses `1.0` and structured generation uses `0.95`. Set to `1.0` to disable.
+            ///   - topK: Top-k sampling override. Positive values restrict sampling to that many
+            ///     tokens; `0` disables it. Defaults to `nil`, which inherits the core top-k count
+            ///     if provided. When neither supplies a count, top-k sampling is disabled.
+            ///   - minP: Min-p sampling threshold. Defaults to `nil` (disabled).
+            ///   - repetitionPenalty: Repetition penalty factor. Defaults to `nil`, which uses no
+            ///     penalty for regular generation or `1.1` for structured generation. Set to `1.0`
+            ///     to neutralize the penalty explicitly.
+            ///   - repetitionContextSize: Repetition-penalty token window. Defaults to `nil`
+            ///     (`20` for regular generation or `64` for structured generation).
+            public init(
+                kvCache: KVCache,
+                userInputProcessing: UserInputProcessing?,
+                additionalContext: [String: AnyLanguageModel.JSONValue]?,
+                topP: Float? = nil,
+                topK: Int? = nil,
+                minP: Float? = nil,
+                repetitionPenalty: Float? = nil,
+                repetitionContextSize: Int? = nil
+            ) {
+                self.kvCache = kvCache
+                self.additionalContext = additionalContext
+                self.userInputProcessing = userInputProcessing
+                self.topP = topP
+                self.topK = topK
+                self.minP = minP
+                self.repetitionPenalty = repetitionPenalty
+                self.repetitionContextSize = repetitionContextSize
+            }
+
+            /// Default MLX generation options used when none are provided at runtime.
+            public static var `default`: Self {
+                .init(
+                    kvCache: .default,
+                    userInputProcessing: nil,
+                    additionalContext: nil
+                )
+            }
+        }
+
+        /// Controls GPU buffer-pool limits during active and idle phases.
+        public struct GPUMemoryConfiguration: Sendable, Hashable {
+            /// The cache limit applied while at least one generation is active.
+            public var activeCacheLimit: Int
+            /// The cache limit applied when no generations are active.
+            public var idleCacheLimit: Int
+            /// Indicates whether MLX clears cached GPU buffers on safe eviction.
+            public var clearCacheOnEviction: Bool
+
+            /// Creates a GPU-memory configuration for MLX generations.
+            ///
+            /// - Parameters:
+            ///   - activeCacheLimit: The GPU cache-limit value used during active generation.
+            ///   - idleCacheLimit: The GPU cache-limit value used while idle.
+            ///   - clearCacheOnEviction: A Boolean value that indicates whether to clear
+            ///     cached GPU buffers when eviction is safe.
+            public init(
+                activeCacheLimit: Int,
+                idleCacheLimit: Int,
+                clearCacheOnEviction: Bool = true
+            ) {
+                self.activeCacheLimit = activeCacheLimit
+                self.idleCacheLimit = idleCacheLimit
+                self.clearCacheOnEviction = clearCacheOnEviction
+            }
+
+            /// Returns a memory configuration using physical-memory heuristics.
+            ///
+            /// The active limit scales with device RAM,
+            /// and the idle limit stays conservative to reduce background memory pressure.
+            public static var automatic: GPUMemoryConfiguration {
+                let ramBytes = ProcessInfo.processInfo.physicalMemory
+                let ramGB = ramBytes / (1024 * 1024 * 1024)
+                let active: Int
+                switch ramGB {
+                case ..<4:
+                    active = 128_000_000
+                case ..<6:
+                    active = 256_000_000
+                case ..<8:
+                    active = 512_000_000
+                default:
+                    active = 768_000_000
+                }
+
+                return .init(
+                    activeCacheLimit: active,
+                    idleCacheLimit: 50_000_000,
+                    clearCacheOnEviction: true
+                )
+            }
+
+            /// Returns a memory configuration that leaves GPU cache effectively unconstrained.
+            ///
+            /// Use this when your application prefers maximum reuse over memory reclamation.
+            public static var unconstrained: GPUMemoryConfiguration {
+                .init(
+                    activeCacheLimit: Int.max,
+                    idleCacheLimit: Int.max,
+                    clearCacheOnEviction: false
+                )
+            }
+        }
+
+        private struct CacheConfigSignature: Equatable {
+            let maxKVSize: Int?
+            let kvBits: Int?
+            let kvGroupSize: Int
+            let quantizedKVStart: Int
+        }
+
+        private final class SessionCacheEntry: @unchecked Sendable {
+            let kvCache: [MLXLMCommon.KVCache]
+            let prefillTokenCount: Int
+            let prefixTokens: [Int32]
+            let cacheConfigSignature: CacheConfigSignature
+            /// Model state that continuing this cache requires, such as M-RoPE position deltas.
+            let state: MLXLMCommon.LMOutput.State?
+
+            init(
+                kvCache: [MLXLMCommon.KVCache],
+                prefillTokenCount: Int,
+                prefixTokens: [Int32],
+                cacheConfigSignature: CacheConfigSignature,
+                state: MLXLMCommon.LMOutput.State?
+            ) {
+                self.kvCache = kvCache
+                self.state = state
+                self.prefillTokenCount = prefillTokenCount
+                self.prefixTokens = prefixTokens
+                self.cacheConfigSignature = cacheConfigSignature
+            }
+        }
+
+        private final class SessionKVStore: @unchecked Sendable {
+            private final class WeakSessionReference: @unchecked Sendable {
+                weak var session: LanguageModelSession?
+
+                init(_ session: LanguageModelSession) {
+                    self.session = session
+                }
+            }
+
+            private struct SessionBucket {
+                let sessionReference: WeakSessionReference
+                var modelEntries: [String: SessionCacheEntry]
+            }
+
+            private let lock = NSLock()
+            private var buckets: [ObjectIdentifier: SessionBucket] = [:]
+
+            func entry(
+                for session: LanguageModelSession,
+                modelKey: String
+            ) -> SessionCacheEntry? {
+                lock.withLock {
+                    reapDeadSessionsLocked()
+                    return buckets[ObjectIdentifier(session)]?.modelEntries[modelKey]
+                }
+            }
+
+            func set(
+                _ entry: SessionCacheEntry,
+                for session: LanguageModelSession,
+                modelKey: String
+            ) {
+                lock.withLock {
+                    reapDeadSessionsLocked()
+                    let id = ObjectIdentifier(session)
+                    var bucket =
+                        buckets[id]
+                        ?? SessionBucket(
+                            sessionReference: WeakSessionReference(session),
+                            modelEntries: [:]
+                        )
+                    bucket.modelEntries[modelKey] = entry
+                    buckets[id] = bucket
+                }
+            }
+
+            func removeEntry(
+                for session: LanguageModelSession,
+                modelKey: String
+            ) {
+                lock.withLock {
+                    reapDeadSessionsLocked()
+                    let id = ObjectIdentifier(session)
+                    guard var bucket = buckets[id] else {
+                        return
+                    }
+                    bucket.modelEntries[modelKey] = nil
+                    if bucket.modelEntries.isEmpty {
+                        buckets[id] = nil
+                    } else {
+                        buckets[id] = bucket
+                    }
+                }
+            }
+
+            func removeEntries(forModelKey modelKey: String) {
+                lock.withLock {
+                    reapDeadSessionsLocked()
+                    for id in Array(buckets.keys) {
+                        guard var bucket = buckets[id] else {
+                            continue
+                        }
+                        bucket.modelEntries[modelKey] = nil
+                        if bucket.modelEntries.isEmpty {
+                            buckets[id] = nil
+                        } else {
+                            buckets[id] = bucket
+                        }
+                    }
+                }
+            }
+
+            func removeAll() {
+                lock.withLock {
+                    buckets.removeAll()
+                }
+            }
+
+            private func reapDeadSessionsLocked() {
+                let deadSessionIDs = buckets.compactMap { id, bucket in
+                    bucket.sessionReference.session == nil ? id : nil
+                }
+                for id in deadSessionIDs {
+                    buckets[id] = nil
+                }
+            }
+        }
+
+        private final class SessionGenerationGate: @unchecked Sendable {
+            private let lock = NSLock()
+            private var activeSessions: Set<ObjectIdentifier> = []
+
+            func acquire(session: LanguageModelSession) -> Bool {
+                lock.withLock {
+                    let id = ObjectIdentifier(session)
+                    guard !activeSessions.contains(id) else {
+                        return false
+                    }
+                    activeSessions.insert(id)
+                    return true
+                }
+            }
+
+            func release(session: LanguageModelSession) {
+                _ = lock.withLock {
+                    activeSessions.remove(ObjectIdentifier(session))
+                }
+            }
+        }
+
+        private final class GPUMemoryManager: @unchecked Sendable {
+            static let shared = GPUMemoryManager()
+
+            private let lock = NSLock()
+            private var knownConfigs: Set<GPUMemoryConfiguration> = []
+            private var activeScopes: [UUID: GPUMemoryConfiguration] = [:]
+
+            private init() {
+                MLX.Memory.cacheLimit = GPUMemoryConfiguration.automatic.idleCacheLimit
+            }
+
+            func register(_ configuration: GPUMemoryConfiguration) {
+                var cacheLimitToSet: Int?
+                lock.withLock {
+                    knownConfigs.insert(configuration)
+                    if activeScopes.isEmpty {
+                        cacheLimitToSet = effectiveIdleLimit()
+                    }
+                }
+                if let cacheLimitToSet {
+                    MLX.Memory.cacheLimit = cacheLimitToSet
+                }
+            }
+
+            func markActive(_ configuration: GPUMemoryConfiguration) -> UUID {
+                let id = UUID()
+                let cacheLimitToSet = lock.withLock {
+                    knownConfigs.insert(configuration)
+                    activeScopes[id] = configuration
+                    return effectiveActiveLimit()
+                }
+                MLX.Memory.cacheLimit = cacheLimitToSet
+                return id
+            }
+
+            func markIdle(scope id: UUID) {
+                let cacheLimitToSet = lock.withLock {
+                    activeScopes.removeValue(forKey: id)
+                    if activeScopes.isEmpty {
+                        return effectiveIdleLimit()
+                    }
+                    return effectiveActiveLimit()
+                }
+                MLX.Memory.cacheLimit = cacheLimitToSet
+            }
+
+            func evictIfSafe() {
+                var shouldUpdateCacheLimit = false
+                var cacheLimitToSet = 0
+                var shouldClearCache = false
+                lock.withLock {
+                    guard activeScopes.isEmpty else { return }
+                    shouldUpdateCacheLimit = true
+                    cacheLimitToSet = effectiveIdleLimit()
+                    shouldClearCache = shouldClearOnEviction()
+                }
+                guard shouldUpdateCacheLimit else { return }
+                MLX.Memory.cacheLimit = cacheLimitToSet
+                if shouldClearCache {
+                    MLX.Memory.clearCache()
+                }
+            }
+
+            private func effectiveActiveLimit() -> Int {
+                let limits = activeScopes.values.map(\.activeCacheLimit)
+                return limits.max() ?? effectiveIdleLimit()
+            }
+
+            private func idlePolicyConfiguration() -> GPUMemoryConfiguration {
+                knownConfigs.max(by: { $0.idleCacheLimit < $1.idleCacheLimit })
+                    ?? GPUMemoryConfiguration.automatic
+            }
+
+            private func effectiveIdleLimit() -> Int {
+                idlePolicyConfiguration().idleCacheLimit
+            }
+
+            private func shouldClearOnEviction() -> Bool {
+                idlePolicyConfiguration().clearCacheOnEviction
+            }
+        }
+
+        private static let sessionKVCache = SessionKVStore()
+        private static let sessionGenerationGate = SessionGenerationGate()
+
+        /// The model identifier.
+        public let modelId: String
+
+        /// The Hugging Face Hub client used for downloading models.
+        public let hub: HubClient?
+
+        /// The local directory containing the model files.
+        public let directory: URL?
+
+        /// GPU memory behavior used for this model's generation scopes.
+        public let gpuMemory: GPUMemoryConfiguration
+
+        /// Creates an MLX language model.
+        ///
+        /// - Parameters:
+        ///   - modelId: The model identifier (for example, "mlx-community/Llama-3.2-3B-Instruct-4bit").
+        ///   - hub: An optional Hugging Face Hub client for downloading models. If not provided, the default client is used.
+        ///   - directory: An optional local directory URL containing the model files. If provided, the model is loaded from this directory instead of downloading.
+        ///   - gpuMemory: The GPU-memory behavior used for this model's active and idle phases.
+        public init(
+            modelId: String,
+            hub: HubClient? = nil,
+            directory: URL? = nil,
+            gpuMemory: GPUMemoryConfiguration = .automatic
+        ) {
+            self.modelId = modelId
+            self.hub = hub
+            self.directory = directory
+            self.gpuMemory = gpuMemory
+            GPUMemoryManager.shared.register(gpuMemory)
+        }
+
+        /// The current availability of this model in memory.
+        public var availability: Availability<UnavailableReason> {
+            let key = directory?.absoluteString ?? modelId
+            if modelCache.contains(key) {
+                return .available
+            }
+
+            if let failureDescription = modelCache.failureDescription(for: key) {
+                return .unavailable(.failedToLoad(failureDescription))
+            }
+
+            return .unavailable(.notLoaded)
+        }
+
+        /// Removes this model from the shared cache and cancels any in-flight load.
+        ///
+        /// Call this to free memory when the model is no longer needed.
+        /// The model will be reloaded automatically on the next request.
+        public func removeFromCache() async {
+            let key = directory?.absoluteString ?? modelId
+            await modelCache.removeAndCancel(for: key)
+            Self.removeSessionCaches(forModelKey: modelSessionCacheKey())
+            GPUMemoryManager.shared.evictIfSafe()
+        }
+
+        /// Removes all MLX models from the shared cache and cancels in-flight loads.
+        public static func removeAllFromCache() async {
+            await modelCache.removeAllAndCancel()
+            sessionKVCache.removeAll()
+            GPUMemoryManager.shared.evictIfSafe()
+        }
+
+        /// Get or load model context with caching
+        private func loadContext(modelId: String, hub: HubClient?, directory: URL?) async throws -> LoadedModelContext {
+            let key = directory?.absoluteString ?? modelId
+
+            return try await modelCache.context(for: key) {
+                // mlx-swift-lm 3 requires explicit downloader and tokenizer loaders,
+                // macros resolve them to be backed by HubClient, AutoTokenizer.
+                if let directory {
+                    return try await loadModel(from: directory, using: #huggingFaceTokenizerLoader())
+                }
+
+                if let hub {
+                    return try await loadModel(
+                        from: #hubDownloader(hub),
+                        using: #huggingFaceTokenizerLoader(),
+                        id: modelId
+                    )
+                }
+
+                return try await loadModel(
+                    from: #hubDownloader(),
+                    using: #huggingFaceTokenizerLoader(),
+                    id: modelId
+                )
+            }
+        }
+
+        private static func sessionKey(model: MLXLanguageModel) -> String {
+            let directoryKey = model.directory?.absoluteString ?? ""
+            return "\(model.modelId)|\(directoryKey)"
+        }
+
+        private func modelSessionCacheKey() -> String {
+            Self.sessionKey(model: self)
+        }
+
+        private func getSessionCache(for session: LanguageModelSession) -> SessionCacheEntry? {
+            Self.sessionKVCache.entry(for: session, modelKey: modelSessionCacheKey())
+        }
+
+        private func setSessionCache(_ entry: SessionCacheEntry, for session: LanguageModelSession) {
+            Self.sessionKVCache.set(entry, for: session, modelKey: modelSessionCacheKey())
+        }
+
+        private func removeSessionCache(for session: LanguageModelSession) {
+            Self.sessionKVCache.removeEntry(for: session, modelKey: modelSessionCacheKey())
+        }
+
+        private static func removeSessionCaches(forModelKey modelKey: String) {
+            sessionKVCache.removeEntries(forModelKey: modelKey)
+        }
+
+        private static func concurrentSessionError() -> LanguageModelSession.GenerationError {
+            .concurrentRequests(
+                .init(
+                    debugDescription:
+                        "Concurrent requests on the same LanguageModelSession are not supported for MLX due to cache and memory management constraints."
+                )
+            )
+        }
+
+        private static func maxToolIterationsExceededError(limit: Int) -> LanguageModelSession.GenerationError {
+            .decodingFailure(
+                .init(
+                    debugDescription:
+                        "Exceeded maximum tool iterations (\(limit)) while processing MLX tool calls."
+                )
+            )
+        }
+
+        private static func repeatedToolCallLoopError() -> LanguageModelSession.GenerationError {
+            .decodingFailure(
+                .init(
+                    debugDescription:
+                        "Detected repeated MLX tool-call signature and aborted to avoid an infinite tool loop."
+                )
+            )
+        }
+
+        private static func acquireGenerationSlot(for session: LanguageModelSession) -> Bool {
+            sessionGenerationGate.acquire(session: session)
+        }
+
+        private static func releaseGenerationSlot(for session: LanguageModelSession) {
+            sessionGenerationGate.release(session: session)
+        }
+
+        private func cacheSignature(from parameters: MLXLMCommon.GenerateParameters) -> CacheConfigSignature {
+            CacheConfigSignature(
+                maxKVSize: parameters.maxKVSize,
+                kvBits: parameters.kvBits,
+                kvGroupSize: parameters.kvGroupSize,
+                quantizedKVStart: parameters.quantizedKVStart
+            )
+        }
+
+        private func tokens(from input: MLXLMCommon.LMInput) -> [Int32] {
+            input.text.tokens.asArray(Int32.self)
+        }
+
+        /// Returns the number of cached tokens that can be reused, or zero for a cache miss.
+        ///
+        /// This is the longest common prefix of the cached and current tokens,
+        /// leaving at least one current token to evaluate.
+        /// Reusing less than the whole cache requires trimming it, so `canTrim` must be true.
+        ///
+        /// A cache whose offset no longer matches the stored prefix was changed
+        /// by a request that ended before storing it, such as a cancelled stream.
+        internal static func reusablePrefixTokenCount(
+            prefixTokens: [Int32],
+            prefillTokenCount: Int,
+            cacheOffset: Int,
+            currentTokens: [Int32],
+            configurationMatches: Bool,
+            hasMedia: Bool,
+            canTrim: Bool
+        ) -> Int {
+            guard !hasMedia, configurationMatches,
+                prefillTokenCount > 0, cacheOffset == prefillTokenCount,
+                prefixTokens.count == prefillTokenCount
+            else { return 0 }
+            let commonCount = zip(prefixTokens, currentTokens).prefix { $0 == $1 }.count
+            let reusableCount = min(commonCount, currentTokens.count - 1)
+            guard reusableCount > 0, reusableCount == prefillTokenCount || canTrim else { return 0 }
+            return reusableCount
+        }
+
+        /// Returns the tokens and mask that follow a cached prefix of `count` tokens.
+        ///
+        /// Tokens are rank 1 from text-only processors and `[1, length]` from some VLM processors,
+        /// so this slices the last axis.
+        internal static func droppingCachedPrefix(
+            of text: MLXLMCommon.LMInput.Text,
+            count: Int
+        ) -> MLXLMCommon.LMInput.Text {
+            MLXLMCommon.LMInput.Text(
+                tokens: text.tokens[.ellipsis, count...],
+                mask: text.mask?[.ellipsis, count...]
+            )
+        }
+
+        private func resolveCache(
+            session: LanguageModelSession,
+            lmInput: MLXLMCommon.LMInput,
+            generateParameters: MLXLMCommon.GenerateParameters,
+            context: ModelContext
+        ) throws -> (
+            cache: [MLXLMCommon.KVCache], input: MLXLMCommon.LMInput, fullTokens: [Int32], cachedTokenCount: Int,
+            state: MLXLMCommon.LMOutput.State?
+        ) {
+            let signature = cacheSignature(from: generateParameters)
+            let fullTokens = tokens(from: lmInput)
+            let existingEntry = getSessionCache(for: session)
+
+            let cachedCount =
+                existingEntry.map { entry in
+                    Self.reusablePrefixTokenCount(
+                        prefixTokens: entry.prefixTokens,
+                        prefillTokenCount: entry.prefillTokenCount,
+                        cacheOffset: entry.kvCache.first?.offset ?? 0,
+                        currentTokens: fullTokens,
+                        configurationMatches: entry.cacheConfigSignature == signature,
+                        hasMedia: lmInput.image != nil || lmInput.video != nil,
+                        canTrim: MLXLMCommon.canTrimPromptCache(entry.kvCache)
+                    )
+                } ?? 0
+            if let existingEntry, cachedCount > 0 {
+                if cachedCount < existingEntry.prefillTokenCount {
+                    MLXLMCommon.trimPromptCache(
+                        existingEntry.kvCache,
+                        numTokens: existingEntry.prefillTokenCount - cachedCount
+                    )
+                }
+                let partialText = Self.droppingCachedPrefix(of: lmInput.text, count: cachedCount)
+                return (
+                    existingEntry.kvCache, MLXLMCommon.LMInput(text: partialText), fullTokens, cachedCount,
+                    existingEntry.state
+                )
+            }
+
+            if existingEntry != nil {
+                removeSessionCache(for: session)
+            }
+
+            let newCache = try context.model.newCache(parameters: generateParameters)
+            return (newCache, lmInput, fullTokens, 0, nil)
+        }
+
+        /// Starts generation, reusing the session's cache when it can.
+        ///
+        /// Some models, such as Qwen3-VL, need model state along with a reused cache.
+        /// The session cache keeps the state from the request that filled it.
+        /// If a model still throws `ContinuationStateError`,
+        /// drop the session cache and start from an empty one.
+        private func startGeneration(
+            session: LanguageModelSession,
+            lmInput: MLXLMCommon.LMInput,
+            generateParameters: MLXLMCommon.GenerateParameters,
+            context: ModelContext
+        ) throws -> (
+            stream: AsyncStream<MLXLMCommon.Generation>, cache: [MLXLMCommon.KVCache], fullTokens: [Int32],
+            cachedTokenCount: Int, state: MLXLMCommon.LMOutput.State?
+        ) {
+            func start(
+                _ resolved: (
+                    cache: [MLXLMCommon.KVCache], input: MLXLMCommon.LMInput, fullTokens: [Int32],
+                    cachedTokenCount: Int, state: MLXLMCommon.LMOutput.State?
+                )
+            ) throws -> (
+                stream: AsyncStream<MLXLMCommon.Generation>, cache: [MLXLMCommon.KVCache], fullTokens: [Int32],
+                cachedTokenCount: Int, state: MLXLMCommon.LMOutput.State?
+            ) {
+                // Creating the iterator evaluates the prompt.
+                // Its state then anchors the next request that reuses this cache.
+                let iterator = try MLXLMCommon.TokenIterator(
+                    input: resolved.input,
+                    model: context.model,
+                    cache: resolved.cache,
+                    state: resolved.state,
+                    parameters: generateParameters
+                )
+                let state = iterator.state
+                let (stream, _) = MLXLMCommon.generateTask(
+                    promptTokenCount: resolved.input.text.tokens.size,
+                    modelConfiguration: context.configuration,
+                    tokenizer: context.tokenizer,
+                    iterator: iterator,
+                    toolCallPolicy: generateParameters.toolCallPolicy
+                )
+                return (stream, resolved.cache, resolved.fullTokens, resolved.cachedTokenCount, state)
+            }
+
+            let resolved = try resolveCache(
+                session: session,
+                lmInput: lmInput,
+                generateParameters: generateParameters,
+                context: context
+            )
+            do {
+                return try start(resolved)
+            } catch is MLXLMCommon.ContinuationStateError where resolved.cachedTokenCount > 0 {
+                removeSessionCache(for: session)
+                return try start(
+                    resolveCache(
+                        session: session,
+                        lmInput: lmInput,
+                        generateParameters: generateParameters,
+                        context: context
+                    )
+                )
+            }
+        }
+
+        private func storeSessionCache(
+            cache: [MLXLMCommon.KVCache],
+            fullTokens: [Int32],
+            state: MLXLMCommon.LMOutput.State?,
+            generateParameters: MLXLMCommon.GenerateParameters,
+            session: LanguageModelSession
+        ) {
+            // After generation, the cache also holds the response tokens.
+            // The next prompt encodes the response again through the chat template,
+            // so keep only the prompt, or drop the entry if the cache can't be trimmed.
+            let generatedCount = (cache.first?.offset ?? 0) - fullTokens.count
+            if generatedCount > 0 {
+                guard MLXLMCommon.canTrimPromptCache(cache) else {
+                    removeSessionCache(for: session)
+                    return
+                }
+                MLXLMCommon.trimPromptCache(cache, numTokens: generatedCount)
+            }
+
+            let offset = cache.first?.offset ?? 0
+            let prefillCount = max(0, min(offset, fullTokens.count))
+            guard prefillCount > 0 else {
+                removeSessionCache(for: session)
+                return
+            }
+
+            let prefixTokens = Array(fullTokens.prefix(prefillCount))
+            let entry = SessionCacheEntry(
+                kvCache: cache,
+                prefillTokenCount: prefillCount,
+                prefixTokens: prefixTokens,
+                cacheConfigSignature: cacheSignature(from: generateParameters),
+                state: state
+            )
+            setSessionCache(entry, for: session)
+        }
+
+        private func beginGenerationScope() -> UUID {
+            GPUMemoryManager.shared.markActive(gpuMemory)
+        }
+
+        private func endGenerationScope(_ id: UUID) {
+            GPUMemoryManager.shared.markIdle(scope: id)
+        }
+
+        private func mlxToolSpecs(for tools: [any Tool]) -> [ToolSpec]? {
+            tools.isEmpty ? nil : tools.map { convertToolToMLXSpec($0) }
+        }
+
+        private func makeUserInput(
+            chat: [MLXLMCommon.Chat.Message],
+            tools: [ToolSpec]?,
+            processing: MLXLMCommon.UserInput.Processing = .init(resize: nil),
+            additionalContext: [String: any Sendable]? = nil
+        ) -> MLXLMCommon.UserInput {
+            return MLXLMCommon.UserInput(
+                chat: chat,
+                processing: processing,
+                tools: tools,
+                additionalContext: additionalContext,
+            )
+        }
+
+        public func respond<Content>(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            generating type: Content.Type,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
+            try await respond(
+                within: session,
+                to: prompt,
+                generating: type,
+                schema: type.generationSchema,
+                includeSchemaInPrompt: includeSchemaInPrompt,
+                options: options
+            )
+        }
+
+        public func respond(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            schema: GenerationSchema,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) async throws -> LanguageModelSession.Response<GeneratedContent> {
+            try await respond(
+                within: session,
+                to: prompt,
+                generating: GeneratedContent.self,
+                schema: schema,
+                includeSchemaInPrompt: includeSchemaInPrompt,
+                options: options
+            )
+        }
+
+        private func respond<Content>(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            generating type: Content.Type,
+            schema: GenerationSchema,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) async throws -> LanguageModelSession.Response<Content> where Content: Generable {
+            guard Self.acquireGenerationSlot(for: session) else {
+                throw Self.concurrentSessionError()
+            }
+            defer { Self.releaseGenerationSlot(for: session) }
+
+            // Get cached or load fresh ModelContext
+            let loaded = try await loadContext(modelId: modelId, hub: hub, directory: directory)
+            defer { withExtendedLifetime(loaded) {} }
+            let context = loaded.context
+            let generationScope = beginGenerationScope()
+            defer { endGenerationScope(generationScope) }
+
+            if type != String.self {
+                let requestContext = session.resolvedRequestContext()
+                let (jsonString, usage) = try await generateStructuredJSON(
+                    context: context,
+                    tokenCache: loaded.tokenCache,
+                    requestContext: requestContext,
+                    prompt: prompt,
+                    schema: schema,
+                    options: options,
+                    includeSchemaInPrompt: includeSchemaInPrompt
+                )
+                let generatedContent = try GeneratedContent(json: jsonString)
+                let content = try type.init(generatedContent)
+                return LanguageModelSession.Response(
+                    content: content,
+                    rawContent: generatedContent,
+                    transcriptEntries: ArraySlice([]),
+                    usage: usage
+                )
+            }
+
+            // Map AnyLanguageModel GenerationOptions to MLX GenerateParameters
+            let generateParameters = toGenerateParameters(options)
+
+            // Extract additional context from custom options
+            let additionalContext = options[custom: MLXLanguageModel.self]?.additionalContextForUserInput
+            let userInputProcessing =
+                options[custom: MLXLanguageModel.self]?.processingForUserInput
+                ?? .init(resize: nil)
+
+            var pendingChat: [MLXLMCommon.Chat.Message] = []
+
+            var usage = LanguageModelSession.Usage.zero
+            var allTextChunks: [String] = []
+            var allEntries: [Transcript.Entry] = []
+            let maxToolIterations = 8
+            var toolIteration = 0
+            var previousToolCallSignature: String?
+
+            // Loop until no more tool calls
+            while true {
+                let requestContext = session.resolvedRequestContext()
+                let toolSpecs = mlxToolSpecs(for: requestContext.tools)
+                let chat =
+                    convertTranscriptToMLXChat(
+                        requestContext: requestContext,
+                        fallbackPrompt: prompt.description
+                    ) + pendingChat
+                // Build user input with current chat history and tools
+                let userInput = makeUserInput(
+                    chat: chat,
+                    tools: toolSpecs,
+                    processing: userInputProcessing,
+                    additionalContext: additionalContext
+                )
+                let lmInput = try await context.processor.prepare(input: userInput)
+                // Generate
+                let resolved = try startGeneration(
+                    session: session,
+                    lmInput: lmInput,
+                    generateParameters: generateParameters,
+                    context: context
+                )
+                let stream = resolved.stream
+
+                var chunks: [String] = []
+                var collectedToolCalls: [MLXLMCommon.ToolCall] = []
+                var rejectedToolCall: MLXLMCommon.RejectedToolCall?
+
+                for await item in stream {
+                    switch item {
+                    case .chunk(let text):
+                        chunks.append(text)
+                    case .info(let info):
+                        usage.add(
+                            LocalGenerationUsage(
+                                promptTokenCount: lmInput.text.tokens.size,
+                                cachedTokenCount: resolved.cachedTokenCount,
+                                generatedTokenCount: info.generationTokenCount
+                            ).value
+                        )
+                    case .toolCall(let call):
+                        collectedToolCalls.append(call)
+                    case .rejectedToolCall(let rejection):
+                        rejectedToolCall = rejectedToolCall ?? rejection
+                    }
+                }
+                if let rejectedToolCall {
+                    removeSessionCache(for: session)
+                    throw MLXLMCommon.RejectedToolCallError(rejectedToolCall)
+                }
+                storeSessionCache(
+                    cache: resolved.cache,
+                    fullTokens: resolved.fullTokens,
+                    state: resolved.state,
+                    generateParameters: generateParameters,
+                    session: session
+                )
+
+                let assistantText = chunks.joined()
+                allTextChunks.append(assistantText)
+
+                // Add assistant response to chat history
+                if !assistantText.isEmpty {
+                    pendingChat.append(.assistant(assistantText))
+                }
+
+                // If there are tool calls, execute them and continue
+                if !collectedToolCalls.isEmpty {
+                    toolIteration += 1
+                    if toolIteration > maxToolIterations {
+                        let unresolvedCalls = try makeTranscriptToolCalls(from: collectedToolCalls)
+                        allEntries.append(Transcript.Entry.toolCalls(Transcript.ToolCalls(unresolvedCalls)))
+                        throw Self.maxToolIterationsExceededError(limit: maxToolIterations)
+                    }
+
+                    let signature =
+                        collectedToolCalls
+                        .map { "\($0.function.name):\($0.function.arguments)" }
+                        .joined(separator: "|")
+                    if signature == previousToolCallSignature {
+                        let unresolvedCalls = try makeTranscriptToolCalls(from: collectedToolCalls)
+                        allEntries.append(Transcript.Entry.toolCalls(Transcript.ToolCalls(unresolvedCalls)))
+                        throw Self.repeatedToolCallLoopError()
+                    }
+                    previousToolCallSignature = signature
+
+                    let resolution = try await resolveToolCalls(
+                        collectedToolCalls,
+                        tools: requestContext.tools,
+                        session: session
+                    )
+                    switch resolution {
+                    case .stop(let calls):
+                        if !calls.isEmpty {
+                            allEntries.append(.toolCalls(Transcript.ToolCalls(calls)))
+                        }
+                        return LanguageModelSession.Response(
+                            content: "" as! Content,
+                            rawContent: GeneratedContent(""),
+                            transcriptEntries: ArraySlice(allEntries),
+                            usage: usage
+                        )
+                    case .invocations(let invocations):
+                        if !invocations.isEmpty {
+                            allEntries.append(.toolCalls(Transcript.ToolCalls(invocations.map(\.call))))
+
+                            // Execute each tool and add results to chat
+                            for invocation in invocations {
+                                allEntries.append(.toolOutput(invocation.output))
+
+                                // Convert tool output to JSON string for MLX
+                                let toolResultJSON = toolOutputToJSON(invocation.output)
+                                pendingChat.append(.tool(toolResultJSON))
+                            }
+
+                            // Continue loop to generate with tool results
+                            continue
+                        }
+                    }
+                }
+
+                // No more tool calls, exit loop
+                break
+            }
+
+            let text = allTextChunks.joined()
+            return LanguageModelSession.Response(
+                content: text as! Content,
+                rawContent: GeneratedContent(text),
+                transcriptEntries: ArraySlice(allEntries),
+                usage: usage
+            )
+        }
+
+        public func streamResponse<Content>(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            generating type: Content.Type,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) -> sending LanguageModelSession.ResponseStream<Content> where Content: Generable {
+            streamResponse(
+                within: session,
+                to: prompt,
+                generating: type,
+                schema: type.generationSchema,
+                includeSchemaInPrompt: includeSchemaInPrompt,
+                options: options
+            )
+        }
+
+        public func streamResponse(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            schema: GenerationSchema,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) -> sending LanguageModelSession.ResponseStream<GeneratedContent> {
+            streamResponse(
+                within: session,
+                to: prompt,
+                generating: GeneratedContent.self,
+                schema: schema,
+                includeSchemaInPrompt: includeSchemaInPrompt,
+                options: options
+            )
+        }
+
+        private func streamResponse<Content>(
+            within session: LanguageModelSession,
+            to prompt: Prompt,
+            generating type: Content.Type,
+            schema: GenerationSchema,
+            includeSchemaInPrompt: Bool,
+            options: GenerationOptions
+        ) -> sending LanguageModelSession.ResponseStream<Content> where Content: Generable {
+            guard type == String.self else {
+                return streamStructuredResponse {
+                    try await self.respond(
+                        within: session,
+                        to: prompt,
+                        generating: type,
+                        schema: schema,
+                        includeSchemaInPrompt: includeSchemaInPrompt,
+                        options: options
+                    )
+                }
+            }
+            guard Self.acquireGenerationSlot(for: session) else {
+                let error = Self.concurrentSessionError()
+                let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> =
+                    .init { continuation in
+                        continuation.finish(throwing: error)
+                    }
+                return LanguageModelSession.ResponseStream(stream: stream)
+            }
+
+            let modelId = self.modelId
+            let hub = self.hub
+            let directory = self.directory
+            let gpuMemory = self.gpuMemory
+
+            let stream: AsyncThrowingStream<LanguageModelSession.ResponseStream<Content>.Snapshot, any Error> = .init {
+                continuation in
+                let didEndScope = Locked(false)
+                let didReleaseGenerationSlot = Locked(false)
+                let generationScope = GPUMemoryManager.shared.markActive(gpuMemory)
+
+                let task = Task { @Sendable in
+                    func finishScope() {
+                        didEndScope.withLock { done in
+                            if !done {
+                                GPUMemoryManager.shared.markIdle(scope: generationScope)
+                                done = true
+                            }
+                        }
+                    }
+
+                    func finishGenerationSlot() {
+                        didReleaseGenerationSlot.withLock { done in
+                            if !done {
+                                Self.releaseGenerationSlot(for: session)
+                                done = true
+                            }
+                        }
+                    }
+
+                    do {
+                        // Get cached or load fresh ModelContext
+                        let loaded = try await loadContext(modelId: modelId, hub: hub, directory: directory)
+                        defer { withExtendedLifetime(loaded) {} }
+                        let context = loaded.context
+
+                        // Build chat inside task to avoid Sendable issues
+                        let generateParameters = toGenerateParameters(options)
+                        let additionalContext = options[custom: MLXLanguageModel.self]?.additionalContextForUserInput
+                        let userInputProcessing =
+                            options[custom: MLXLanguageModel.self]?.processingForUserInput
+                            ?? .init(resize: nil)
+                        var pendingChat: [MLXLMCommon.Chat.Message] = []
+
+                        // Accumulators live outside the tool loop so streamed snapshots stay
+                        // monotonic across rounds: text never shrinks, entries only grow.
+                        var usage = LanguageModelSession.Usage.zero
+                        var accumulatedText = ""
+                        var accumulatedEntries: [Transcript.Entry] = []
+                        let maxToolIterations = 8
+                        var toolIteration = 0
+                        var previousToolCallSignature: String?
+
+                        // Yields a snapshot carrying the cumulative text and tool entries so far.
+                        func yieldSnapshot() {
+                            let raw = GeneratedContent(accumulatedText)
+                            let content: Content.PartiallyGenerated = (accumulatedText as! Content)
+                                .asPartiallyGenerated()
+                            continuation.yield(
+                                .init(
+                                    content: content,
+                                    rawContent: raw,
+                                    transcriptEntries: ArraySlice(accumulatedEntries),
+                                    usage: usage
+                                )
+                            )
+                        }
+
+                        // Loop until the model stops without pending tool calls (mirrors `respond()`).
+                        toolLoop: while true {
+                            let requestContext = session.resolvedRequestContext()
+                            let toolSpecs = mlxToolSpecs(for: requestContext.tools)
+                            let chat =
+                                convertTranscriptToMLXChat(
+                                    requestContext: requestContext,
+                                    fallbackPrompt: prompt.description
+                                ) + pendingChat
+                            let userInput = makeUserInput(
+                                chat: chat,
+                                tools: toolSpecs,
+                                processing: userInputProcessing,
+                                additionalContext: additionalContext
+                            )
+                            let lmInput = try await context.processor.prepare(input: userInput)
+                            let resolved = try startGeneration(
+                                session: session,
+                                lmInput: lmInput,
+                                generateParameters: generateParameters,
+                                context: context
+                            )
+                            let mlxStream = resolved.stream
+
+                            let roundStartTextCount = accumulatedText.count
+                            var collectedToolCalls: [MLXLMCommon.ToolCall] = []
+                            var rejectedToolCall: MLXLMCommon.RejectedToolCall?
+
+                            for await item in mlxStream {
+                                if Task.isCancelled { break toolLoop }
+
+                                switch item {
+                                case .chunk(let text):
+                                    accumulatedText += text
+                                    yieldSnapshot()
+                                case .toolCall(let call):
+                                    collectedToolCalls.append(call)
+                                case .rejectedToolCall(let rejection):
+                                    rejectedToolCall = rejectedToolCall ?? rejection
+                                case .info(let info):
+                                    usage.add(
+                                        LocalGenerationUsage(
+                                            promptTokenCount: lmInput.text.tokens.size,
+                                            cachedTokenCount: resolved.cachedTokenCount,
+                                            generatedTokenCount: info.generationTokenCount
+                                        ).value
+                                    )
+                                    yieldSnapshot()
+                                }
+                            }
+                            if let rejectedToolCall {
+                                removeSessionCache(for: session)
+                                throw MLXLMCommon.RejectedToolCallError(rejectedToolCall)
+                            }
+
+                            storeSessionCache(
+                                cache: resolved.cache,
+                                fullTokens: resolved.fullTokens,
+                                state: resolved.state,
+                                generateParameters: generateParameters,
+                                session: session
+                            )
+
+                            // Feed this round's assistant text back into the chat history.
+                            let roundText = String(accumulatedText.dropFirst(roundStartTextCount))
+                            if !roundText.isEmpty {
+                                pendingChat.append(.assistant(roundText))
+                            }
+
+                            guard !collectedToolCalls.isEmpty else { break }
+
+                            toolIteration += 1
+                            if toolIteration > maxToolIterations {
+                                throw Self.maxToolIterationsExceededError(limit: maxToolIterations)
+                            }
+
+                            let signature =
+                                collectedToolCalls
+                                .map { "\($0.function.name):\($0.function.arguments)" }
+                                .joined(separator: "|")
+                            if signature == previousToolCallSignature {
+                                throw Self.repeatedToolCallLoopError()
+                            }
+                            previousToolCallSignature = signature
+
+                            let resolution = try await resolveToolCalls(
+                                collectedToolCalls,
+                                tools: requestContext.tools,
+                                session: session
+                            )
+                            switch resolution {
+                            case .stop(let calls):
+                                if !calls.isEmpty {
+                                    accumulatedEntries.append(.toolCalls(Transcript.ToolCalls(calls)))
+                                    yieldSnapshot()
+                                }
+                                break toolLoop
+                            case .invocations(let invocations):
+                                if invocations.isEmpty { break toolLoop }
+
+                                accumulatedEntries.append(
+                                    .toolCalls(Transcript.ToolCalls(invocations.map(\.call)))
+                                )
+                                for invocation in invocations {
+                                    accumulatedEntries.append(.toolOutput(invocation.output))
+                                    pendingChat.append(.tool(toolOutputToJSON(invocation.output)))
+                                }
+                                yieldSnapshot()
+                            }
+                        }
+
+                        finishScope()
+                        finishGenerationSlot()
+                        continuation.finish()
+                    } catch {
+                        finishScope()
+                        finishGenerationSlot()
+                        continuation.finish(throwing: error)
+                    }
+                }
+                continuation.onTermination = { _ in
+                    didEndScope.withLock { done in
+                        if !done {
+                            GPUMemoryManager.shared.markIdle(scope: generationScope)
+                            done = true
+                        }
+                    }
+                    didReleaseGenerationSlot.withLock { done in
+                        if !done {
+                            Self.releaseGenerationSlot(for: session)
+                            done = true
+                        }
+                    }
+                    task.cancel()
+                }
+            }
+
+            return LanguageModelSession.ResponseStream(stream: stream)
+        }
+
+        /// Prewarms the model
+        public func prewarm(
+            for session: LanguageModelSession,
+            promptPrefix: Prompt?
+        ) {
+            Task {
+                await prewarmSessionCache(for: session)
+            }
+        }
+
+        /// Fills the session cache with the session's instructions.
+        internal func prewarmSessionCache(for session: LanguageModelSession) async {
+            let modelId = self.modelId
+            let hub = self.hub
+            let directory = self.directory
+
+            guard Self.acquireGenerationSlot(for: session) else {
+                return
+            }
+            defer { Self.releaseGenerationSlot(for: session) }
+
+            let generationScope = beginGenerationScope()
+            defer { endGenerationScope(generationScope) }
+
+            do {
+                let loaded = try await loadContext(modelId: modelId, hub: hub, directory: directory)
+                defer { withExtendedLifetime(loaded) {} }
+                let context = loaded.context
+                let requestContext = session.resolvedRequestContext()
+                guard let instructions = requestContext.instructions?.description, !instructions.isEmpty else {
+                    return
+                }
+
+                let toolSpecs = mlxToolSpecs(for: requestContext.tools)
+
+                let params = toGenerateParameters(.init())
+                let newCache = try context.model.newCache(parameters: params)
+                let userInput = MLXLMCommon.UserInput(
+                    chat: [.init(role: .system, content: instructions)],
+                    processing: .init(resize: nil),
+                    tools: toolSpecs
+                )
+                let lmInput = try await context.processor.prepare(input: userInput)
+                let prepareResult = try context.model.prepare(
+                    lmInput,
+                    cache: newCache,
+                    state: nil,
+                    prefill: params.prefill
+                )
+                // `prepare` can leave the last chunk for the first decoding step;
+                // evaluate it so that the cache holds every token.
+                var state: MLXLMCommon.LMOutput.State?
+                switch prepareResult {
+                case .logits(let output):
+                    state = output.state
+                case .tokens(let remaining):
+                    if remaining.tokens.size > 0 {
+                        let output = context.model(remaining[text: .newAxis], cache: newCache, state: nil)
+                        eval(newCache)
+                        state = output.state
+                    }
+                }
+                storeSessionCache(
+                    cache: newCache,
+                    fullTokens: tokens(from: lmInput),
+                    state: state,
+                    generateParameters: params,
+                    session: session
+                )
+            } catch {
+                // Ignore errors during prewarm
+            }
+        }
+    }
+
+    // MARK: - Options Mapping
+
+    /// Derives MLX sampler parameters from the core ``GenerationOptions/sampling`` (`SamplingMode`),
+    /// so `.sampling` acts as a unified sampling surface across backends (the same one Apple
+    /// FoundationModels consumes). Returns `nil` for any field the sampling mode doesn't express.
+    ///
+    /// Precedence at the call sites is custom-block → this (sampling) → existing default, so an
+    /// explicit `CustomGenerationOptions` value always wins. The `SamplingMode` seed is forwarded
+    /// to `MLXLMCommon.GenerateParameters` for reproducible sampling.
+    func samplingDerivedParameters(
+        from options: GenerationOptions
+    ) -> (topP: Float?, topK: Int?, greedyTemperature: Float?, seed: UInt64?) {
+        switch options.sampling?.mode {
+        case .greedy:
+            // Greedy = argmax; MLX realizes this with temperature 0.
+            return (topP: nil, topK: nil, greedyTemperature: 0, seed: nil)
+        case .topK(let k, let seed):
+            return (topP: nil, topK: k, greedyTemperature: nil, seed: seed)
+        case .nucleus(let threshold, let seed):
+            return (topP: Float(threshold), topK: nil, greedyTemperature: nil, seed: seed)
+        case nil:
+            return (topP: nil, topK: nil, greedyTemperature: nil, seed: nil)
+        }
+    }
+
+    func toGenerateParameters(_ options: GenerationOptions) -> MLXLMCommon.GenerateParameters {
+        let custom = options[custom: MLXLanguageModel.self]
+        let derived = samplingDerivedParameters(from: options)
+        return MLXLMCommon.GenerateParameters(
+            maxTokens: options.maximumResponseTokens,
+            maxKVSize: custom?.kvCache.maxSize,
+            kvBits: custom?.kvCache.bits,
+            kvGroupSize: custom?.kvCache.groupSize ?? 64,
+            quantizedKVStart: custom?.kvCache.quantizedStart ?? 0,
+            temperature: Float(derived.greedyTemperature.map(Double.init) ?? options.temperature ?? 0.6),
+            topP: custom?.topP ?? derived.topP ?? 1.0,
+            topK: custom?.topK ?? derived.topK ?? 0,
+            minP: custom?.minP ?? 0.0,
+            repetitionPenalty: custom?.repetitionPenalty,
+            repetitionContextSize: custom?.repetitionContextSize ?? 20,
+            seed: derived.seed
+        )
+    }
+
+    /// Builds MLX parameters tuned for structured generation.
+    func toStructuredGenerateParameters(_ options: GenerationOptions) -> MLXLMCommon.GenerateParameters {
+        let custom = options[custom: MLXLanguageModel.self]
+        let derived = samplingDerivedParameters(from: options)
+        return MLXLMCommon.GenerateParameters(
+            maxTokens: options.maximumResponseTokens,
+            maxKVSize: custom?.kvCache.maxSize,
+            kvBits: custom?.kvCache.bits,
+            kvGroupSize: custom?.kvCache.groupSize ?? 64,
+            quantizedKVStart: custom?.kvCache.quantizedStart ?? 0,
+            temperature: Float(derived.greedyTemperature.map(Double.init) ?? options.temperature ?? 0.2),
+            topP: custom?.topP ?? derived.topP ?? 0.95,
+            topK: custom?.topK ?? derived.topK ?? 0,
+            minP: custom?.minP ?? 0.0,
+            repetitionPenalty: custom?.repetitionPenalty ?? 1.1,
+            repetitionContextSize: custom?.repetitionContextSize ?? 64,
+            seed: derived.seed
+        )
+    }
+
+    // MARK: - Transcript Conversion
+
+    private func convertTranscriptToMLXChat(
+        requestContext: LanguageModelSession.RequestContext,
+        fallbackPrompt: String
+    ) -> [MLXLMCommon.Chat.Message] {
+        var chat: [MLXLMCommon.Chat.Message] = []
+
+        // Check if instructions are already in transcript
+        let hasInstructionsInTranscript = requestContext.transcript.contains {
+            if case .instructions = $0 { return true }
+            return false
+        }
+
+        // Add instructions from session if present and not in transcript
+        if !hasInstructionsInTranscript,
+            let instructions = requestContext.instructions?.description,
+            !instructions.isEmpty
+        {
+            chat.append(.init(role: .system, content: instructions))
+        }
+
+        // Convert each transcript entry
+        for entry in requestContext.transcript {
+            switch entry {
+            case .instructions(let instr):
+                chat.append(makeMLXChatMessage(from: instr.segments, role: .system))
+
+            case .prompt(let prompt):
+                chat.append(makeMLXChatMessage(from: prompt.segments, role: .user))
+
+            case .reasoning:
+                // Keep display history in the transcript without sending unsupported replay state.
+                continue
+            case .response(let response):
+                let content = response.segments.map { extractText(from: $0) }.joined(separator: "\n")
+                chat.append(.assistant(content))
+
+            case .toolCalls:
+                // Tool calls are handled inline during generation loop
+                break
+
+            case .toolOutput(let toolOutput):
+                let content = toolOutput.segments.map { extractText(from: $0) }.joined(separator: "\n")
+                chat.append(.tool(content))
+            }
+        }
+
+        // If no user message in transcript, add fallback prompt
+        let hasUserMessage = chat.contains { $0.role == .user }
+        if !hasUserMessage {
+            chat.append(.init(role: .user, content: fallbackPrompt))
+        }
+
+        return chat
+    }
+
+    private func extractText(from segment: Transcript.Segment) -> String {
+        switch segment {
+        case .text(let text):
+            return text.content
+        case .structure(let structured):
+            return structured.content.jsonString
+        case .image:
+            return ""
+        }
+    }
+
+    private func makeMLXChatMessage(
+        from segments: [Transcript.Segment],
+        role: MLXLMCommon.Chat.Message.Role
+    ) -> MLXLMCommon.Chat.Message {
+        var textParts: [String] = []
+        var images: [MLXLMCommon.UserInput.Image] = []
+
+        for segment in segments {
+            switch segment {
+            case .image(let imageSegment):
+                switch imageSegment.source {
+                case .url(let url):
+                    images.append(.url(url))
+                case .data(let data, _):
+                    #if canImport(UIKit)
+                        if let uiImage = UIKit.UIImage(data: data),
+                            let ciImage = CIImage(image: uiImage)
+                        {
+                            images.append(.ciImage(ciImage))
+                        }
+                    #elseif canImport(AppKit)
+                        if let nsImage = AppKit.NSImage(data: data),
+                            let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil)
+                        {
+                            let ciImage = CIImage(cgImage: cgImage)
+                            images.append(.ciImage(ciImage))
+                        }
+                    #endif
+                }
+            default:
+                let text = extractText(from: segment)
+                if !text.isEmpty {
+                    textParts.append(text)
+                }
+            }
+        }
+
+        let content = textParts.joined(separator: "\n")
+        return MLXLMCommon.Chat.Message(role: role, content: content, images: images)
+    }
+
+    // MARK: - Tool Conversion
+
+    private func convertToolToMLXSpec(_ tool: any Tool) -> ToolSpec {
+        // Convert AnyLanguageModel's GenerationSchema to JSON-compatible dictionary
+        let parametersDict: [String: any Sendable]
+        do {
+            let resolvedSchema = tool.parameters.withResolvedRoot() ?? tool.parameters
+            let encoder = JSONEncoder()
+            let data = try encoder.encode(resolvedSchema)
+            if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                // Inline nested `$ref`s (so nested objects keep their real type)
+                // before coercing any residual typeless/array types the chat
+                // template cannot render.
+                let inlined = resolveToolSchemaRefs(json)
+                parametersDict = try convertToSendableJSONObject(normalizeToolSchemaTypes(inlined))
+            } else {
+                parametersDict = makeEmptyJSONSchemaObject()
+            }
+        } catch {
+            parametersDict = makeEmptyJSONSchemaObject()
+        }
+
+        let functionSpec: [String: any Sendable] = [
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": parametersDict,
+        ]
+
+        let toolSpec: ToolSpec = [
+            "type": "function",
+            "function": functionSpec,
+        ]
+
+        return toolSpec
+    }
+
+    private func makeEmptyJSONSchemaObject() -> [String: any Sendable] {
+        [
+            "type": "object",
+            "properties": [String: any Sendable](),
+            "required": [String](),
+        ]
+    }
+
+    private func convertToSendableJSONObject(_ object: [String: Any]) throws -> [String: any Sendable] {
+        var converted: [String: any Sendable] = [:]
+        converted.reserveCapacity(object.count)
+
+        for (key, value) in object {
+            converted[key] = try convertToSendableJSONValue(value)
+        }
+        return converted
+    }
+
+    private func convertToSendableJSONValue(_ value: Any) throws -> any Sendable {
+        if value is NSNull { return MLXLMCommon.JSONValue.null }
+        if let stringValue = value as? String { return stringValue }
+        if let boolValue = value as? Bool { return boolValue }
+        if let intValue = value as? Int { return intValue }
+        if let doubleValue = value as? Double { return doubleValue }
+        if let numberValue = value as? NSNumber {
+            return numberValue.doubleValue
+        }
+        if let arrayValue = value as? [Any] {
+            return try arrayValue.map { try convertToSendableJSONValue($0) }
+        }
+        if let dictionaryValue = value as? [String: Any] {
+            return try convertToSendableJSONObject(dictionaryValue)
+        }
+
+        throw MLXLanguageModelError.unsupportedJSONValueType
+    }
+
+    // MARK: - Tool Invocation Handling
+
+    private struct ToolInvocationResult {
+        let call: Transcript.ToolCall
+        let output: Transcript.ToolOutput
+    }
+
+    private enum ToolResolutionOutcome {
+        case stop(calls: [Transcript.ToolCall])
+        case invocations([ToolInvocationResult])
+    }
+
+    private func makeTranscriptToolCalls(
+        from toolCalls: [MLXLMCommon.ToolCall]
+    ) throws -> [Transcript.ToolCall] {
+        var transcriptCalls: [Transcript.ToolCall] = []
+        transcriptCalls.reserveCapacity(toolCalls.count)
+        for call in toolCalls {
+            let args = try toGeneratedContent(call.function.arguments)
+            let callID = UUID().uuidString
+            transcriptCalls.append(
+                Transcript.ToolCall(
+                    id: callID,
+                    toolName: call.function.name,
+                    arguments: args
+                )
+            )
+        }
+        return transcriptCalls
+    }
+
+    private func resolveToolCalls(
+        _ toolCalls: [MLXLMCommon.ToolCall],
+        tools: [any Tool],
+        session: LanguageModelSession
+    ) async throws -> ToolResolutionOutcome {
+        if toolCalls.isEmpty { return .invocations([]) }
+
+        var toolsByName: [String: any Tool] = [:]
+        for tool in tools {
+            if toolsByName[tool.name] == nil {
+                toolsByName[tool.name] = tool
+            }
+        }
+
+        let transcriptCalls = try makeTranscriptToolCalls(from: toolCalls)
+
+        if let delegate = session.toolExecutionDelegate {
+            await delegate.didGenerateToolCalls(transcriptCalls, in: session)
+        }
+
+        guard !transcriptCalls.isEmpty else { return .invocations([]) }
+
+        var decisions: [ToolExecutionDecision] = []
+        decisions.reserveCapacity(transcriptCalls.count)
+
+        if let delegate = session.toolExecutionDelegate {
+            for call in transcriptCalls {
+                let decision = await delegate.toolCallDecision(for: call, in: session)
+                if case .stop = decision {
+                    return .stop(calls: transcriptCalls)
+                }
+                decisions.append(decision)
+            }
+        } else {
+            decisions = Array(repeating: .execute, count: transcriptCalls.count)
+        }
+
+        var results: [ToolInvocationResult] = []
+        results.reserveCapacity(transcriptCalls.count)
+
+        for (index, call) in transcriptCalls.enumerated() {
+            switch decisions[index] {
+            case .stop:
+                // This branch should be unreachable because `.stop` returns during decision collection.
+                // Keep it as a defensive guard in case that logic changes.
+                return .stop(calls: transcriptCalls)
+            case .provideOutput(let segments):
+                let output = Transcript.ToolOutput(
+                    id: call.id,
+                    toolName: call.toolName,
+                    segments: segments
+                )
+                if let delegate = session.toolExecutionDelegate {
+                    await delegate.didExecuteToolCall(call, output: output, in: session)
+                }
+                results.append(ToolInvocationResult(call: call, output: output))
+            case .execute:
+                guard let tool = toolsByName[call.toolName] else {
+                    let message = Transcript.Segment.text(.init(content: "Tool not found: \(call.toolName)"))
+                    let output = Transcript.ToolOutput(
+                        id: call.id,
+                        toolName: call.toolName,
+                        segments: [message]
+                    )
+                    if let delegate = session.toolExecutionDelegate {
+                        await delegate.didExecuteToolCall(call, output: output, in: session)
+                    }
+                    results.append(ToolInvocationResult(call: call, output: output))
+                    continue
+                }
+
+                do {
+                    let segments = try await tool.makeOutputSegments(from: call.arguments)
+                    let output = Transcript.ToolOutput(
+                        id: call.id,
+                        toolName: tool.name,
+                        segments: segments
+                    )
+                    if let delegate = session.toolExecutionDelegate {
+                        await delegate.didExecuteToolCall(call, output: output, in: session)
+                    }
+                    results.append(ToolInvocationResult(call: call, output: output))
+                } catch {
+                    if let delegate = session.toolExecutionDelegate {
+                        await delegate.didFailToolCall(call, error: error, in: session)
+                    }
+                    throw LanguageModelSession.ToolCallError(tool: tool, underlyingError: error)
+                }
+            }
+        }
+
+        return .invocations(results)
+    }
+
+    private func toGeneratedContent(_ args: [String: MLXLMCommon.JSONValue]) throws -> GeneratedContent {
+        let data = try JSONEncoder().encode(args)
+        let json = String(data: data, encoding: .utf8) ?? "{}"
+        return try GeneratedContent(json: json)
+    }
+
+    private func toolOutputToJSON(_ output: Transcript.ToolOutput) -> String {
+        // Extract text content from segments
+        var textParts: [String] = []
+        for segment in output.segments {
+            switch segment {
+            case .text(let textSegment):
+                textParts.append(textSegment.content)
+            case .structure(let structuredSegment):
+                // structured content already has jsonString property
+                textParts.append(structuredSegment.content.jsonString)
+            case .image:
+                // Image segments are not supported in MLX tool output
+                break
+            }
+        }
+        return textParts.joined(separator: "\n")
+    }
+
+    /// Builds a JSONSchema-informed prompt for structured output.
+    private func schemaPrompt(for schema: GenerationSchema) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard
+            let data = try? encoder.encode(schema),
+            let jsonSchema = try? JSONDecoder().decode(JSONSchema.self, from: data),
+            let schemaJSON = String(data: data, encoding: .utf8)
+        else {
+            return schema.schemaPrompt()
+        }
+
+        var header = "Respond with valid JSON matching this \(jsonSchema.typeName) schema"
+        if let description = jsonSchema.description, !description.isEmpty {
+            header += " (\(description))"
+        }
+
+        if let constValue = jsonSchema.const,
+            let data = try? encoder.encode(constValue),
+            let constString = String(data: data, encoding: .utf8)
+        {
+            header += ". Expected value: \(constString)"
+        } else if let enumValues = jsonSchema.enum, !enumValues.isEmpty,
+            let data = try? encoder.encode(enumValues),
+            let enumString = String(data: data, encoding: .utf8)
+        {
+            header += ". Allowed values: \(enumString)"
+        }
+
+        return "\(header):\n\(schemaJSON)"
+    }
+
+    // MARK: - Structured JSON Generation
+
+    /// Errors that can occur when using MLXLanguageModel.
+    ///
+    /// - Note: This API is exclusive to AnyLanguageModel
+    ///   and using it means your code is no longer drop-in compatible
+    ///   with the Foundation Models framework.
+    public enum MLXLanguageModelError: Error, LocalizedError {
+        case invalidVocabSize
+        case unsupportedJSONValueType
+
+        public var errorDescription: String? {
+            switch self {
+            case .invalidVocabSize:
+                return "Invalid vocabulary size for model output"
+            case .unsupportedJSONValueType:
+                return "Unsupported JSON value type for schema conversion"
+            }
+        }
+    }
+
+    private func generateStructuredJSON(
+        context: ModelContext,
+        tokenCache: StructuredGenerationTokenCache,
+        requestContext: LanguageModelSession.RequestContext,
+        prompt: Prompt,
+        schema: GenerationSchema,
+        options: GenerationOptions,
+        includeSchemaInPrompt: Bool
+    ) async throws -> (String, LanguageModelSession.Usage) {
+        let maxTokens = options.maximumResponseTokens ?? 512
+        let generateParameters = toStructuredGenerateParameters(options)
+
+        let baseChat = convertTranscriptToMLXChat(
+            requestContext: requestContext,
+            fallbackPrompt: prompt.description
+        )
+        let schemaPrompt = includeSchemaInPrompt ? schemaPrompt(for: schema) : nil
+        let chat = normalizeChatForStructuredGeneration(baseChat, schemaPrompt: schemaPrompt)
+
+        let additionalContext = options[custom: MLXLanguageModel.self]?.additionalContextForUserInput
+        let userInputProcessing =
+            options[custom: MLXLanguageModel.self]?.processingForUserInput
+            ?? .init(resize: nil)
+
+        let userInput = MLXLMCommon.UserInput(
+            chat: chat,
+            processing: userInputProcessing,
+            tools: nil,
+            additionalContext: additionalContext,
+        )
+        let lmInput = try await context.processor.prepare(input: userInput)
+
+        let backend = try MLXTokenBackend(
+            context: context,
+            input: lmInput,
+            parameters: generateParameters,
+            maximumTokens: maxTokens,
+            endTokens: []
+        )
+
+        var generator = try ConstrainedJSONGenerator(backend: backend, schema: schema, tokenCache: tokenCache)
+        let json = try await generator.generate()
+        // Ensure pending MLX operations complete before returning JSON.
+        // This synchronization can be a performance cost if called frequently.
+        Stream.gpu.synchronize()
+        return (
+            json,
+            LocalGenerationUsage(
+                promptTokenCount: lmInput.text.tokens.size,
+                generatedTokenCount: generator.generatedTokenCount
+            ).value
+        )
+    }
+
+    /// Merges system prompts and schema instructions into a user message.
+    /// Consecutive messages with the same role are merged to reduce prompt tokens.
+    private func normalizeChatForStructuredGeneration(
+        _ chat: [MLXLMCommon.Chat.Message],
+        schemaPrompt: String?
+    ) -> [MLXLMCommon.Chat.Message] {
+        guard let schemaPrompt, !schemaPrompt.isEmpty else {
+            return chat
+        }
+
+        var systemMessageParts: [String] = []
+        systemMessageParts.append(schemaPrompt)
+
+        var messages: [MLXLMCommon.Chat.Message] = []
+        messages.reserveCapacity(chat.count)
+
+        for message in chat {
+            if message.role == .system {
+                systemMessageParts.append(message.content)
+                continue
+            }
+
+            if let last = messages.last, last.role == message.role {
+                let merged = MLXLMCommon.Chat.Message(role: last.role, content: "\(last.content)\n\(message.content)")
+                messages.removeLast()
+                messages.append(merged)
+            } else {
+                messages.append(message)
+            }
+        }
+
+        let systemPrefix =
+            systemMessageParts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n\n")
+
+        guard !systemPrefix.isEmpty else {
+            return messages
+        }
+
+        if let firstUserIndex = messages.firstIndex(where: { $0.role == .user }) {
+            let existing = messages[firstUserIndex].content
+            messages[firstUserIndex] = MLXLMCommon.Chat.Message(role: .user, content: "\(systemPrefix)\n\n\(existing)")
+            return messages
+        }
+
+        messages.insert(.init(role: .user, content: systemPrefix), at: 0)
+        return messages
+    }
+
+    private struct MLXTokenBackend: TokenBackend {
+        let model: any MLXLMCommon.LanguageModel
+        let tokenizer: any MLXLMCommon.Tokenizer
+        var state: MLXLMCommon.LMOutput.State?
+        var cache: [MLXLMCommon.KVCache]
+        var processor: MLXLMCommon.LogitProcessor?
+        let sampler: MLXLMCommon.LogitSampler
+        let tokensExcludedFromRepetitionPenalty: Set<Int>
+        let endTokens: Set<Int>
+
+        var currentLogits: MLXArray
+        let vocabSize: Int
+        let eosToken: Int
+        var remainingTokens: Int
+        let totalTokenBudget: Int
+
+        init(
+            context: ModelContext,
+            input: MLXLMCommon.LMInput,
+            parameters: MLXLMCommon.GenerateParameters,
+            maximumTokens: Int,
+            endTokens: Set<Int>? = nil
+        ) throws {
+            self.model = context.model
+            self.tokenizer = context.tokenizer
+            self.state = nil
+            self.cache = try context.model.newCache(parameters: parameters)
+            self.processor = parameters.processor()
+            self.sampler = parameters.sampler()
+            self.remainingTokens = maximumTokens
+            self.totalTokenBudget = maximumTokens
+            guard let eosTokenId = context.tokenizer.eosTokenId else {
+                throw MLXLanguageModelError.invalidVocabSize
+            }
+            self.eosToken = eosTokenId
+            if let endTokens {
+                self.endTokens = endTokens
+            } else {
+                self.endTokens = Self.buildEndTokens(
+                    eosTokenId: eosTokenId,
+                    tokenizer: context.tokenizer,
+                    configuration: context.configuration
+                )
+            }
+
+            self.tokensExcludedFromRepetitionPenalty = Self.buildTokensExcludedFromRepetitionPenalty(
+                tokenizer: context.tokenizer
+            )
+
+            processor?.prompt(input.text.tokens)
+
+            let prepareResult = try context.model.prepare(
+                input,
+                cache: cache,
+                state: nil,
+                prefill: parameters.prefill
+            )
+
+            let output: MLXLMCommon.LMOutput
+            switch prepareResult {
+            case .tokens(let tokensToProcess):
+                output = context.model(
+                    tokensToProcess[text: .newAxis],
+                    cache: cache,
+                    state: state
+                )
+            case .logits(let logitsOutput):
+                output = logitsOutput
+            }
+
+            self.state = output.state
+            self.currentLogits = output.logits
+
+            guard output.logits.shape.count >= 1 else {
+                throw MLXLanguageModelError.invalidVocabSize
+            }
+            self.vocabSize = output.logits.shape.last ?? 0
+            guard self.vocabSize > 0 else {
+                throw MLXLanguageModelError.invalidVocabSize
+            }
+        }
+
+        private static func buildEndTokens(
+            eosTokenId: Int,
+            tokenizer: any MLXLMCommon.Tokenizer,
+            configuration: ModelConfiguration
+        ) -> Set<Int> {
+            var tokens: Set<Int> = [eosTokenId]
+
+            // If the tokenizer declares an EOS token string, prefer treating its ID as an end token too.
+            // Some chat models use a string EOS marker (e.g. "<end_of_turn>") whose ID may differ from eosTokenId.
+            if let eosString = tokenizer.eosToken, let eosStringId = tokenizer.convertTokenToId(eosString) {
+                tokens.insert(eosStringId)
+            }
+
+            for tokenString in configuration.extraEOSTokens {
+                if let id = tokenizer.convertTokenToId(tokenString) {
+                    tokens.insert(id)
+                }
+            }
+            return tokens
+        }
+
+        func isSpecialToken(_ token: Int) -> Bool {
+            // Use swift-transformers' own special token registry (skipSpecialTokens) instead of guessing.
+            let raw = tokenizer.decode(tokenIds: [token], skipSpecialTokens: false)
+            guard !raw.isEmpty else { return false }
+            let filtered = tokenizer.decode(tokenIds: [token], skipSpecialTokens: true)
+            return filtered.isEmpty
+        }
+
+        private static func buildTokensExcludedFromRepetitionPenalty(tokenizer: any MLXLMCommon.Tokenizer) -> Set<Int> {
+            let excludedTexts = ["{", "}", "[", "]", ",", ":", "\""]
+            var excluded = Set<Int>()
+            excluded.reserveCapacity(excludedTexts.count * 2)
+
+            for text in excludedTexts {
+                let tokens = tokenizer.encode(text: text, addSpecialTokens: false)
+                for token in tokens {
+                    excluded.insert(token)
+                }
+            }
+
+            return excluded
+        }
+
+        func tokenize(_ text: String) throws -> [Int] {
+            tokenizer.encode(text: text, addSpecialTokens: false)
+        }
+
+        func tokenText(_ token: Int) -> String? {
+            let decoded = tokenizer.decode(tokenIds: [token], skipSpecialTokens: false)
+            return decoded.isEmpty ? nil : decoded
+        }
+
+        mutating func decode(_ token: Int) async throws {
+            let inputText = MLXLMCommon.LMInput.Text(tokens: MLXArray([Int32(token)]))
+            let output = model(
+                inputText[text: .newAxis],
+                cache: cache.isEmpty ? nil : cache,
+                state: state
+            )
+            state = output.state
+            currentLogits = output.logits
+            remainingTokens -= 1
+
+            if !tokensExcludedFromRepetitionPenalty.contains(token) {
+                let tokenArray = MLXArray(Int32(token))
+                processor?.didSample(token: tokenArray)
+            }
+        }
+
+        mutating func sample(from allowedTokens: Set<Int>) async throws -> Int {
+            guard !allowedTokens.isEmpty else {
+                throw ConstrainedGenerationError.tokenizationFailed
+            }
+
+            var logits = currentLogits[0..., -1, 0...]
+            logits = processor?.process(logits: logits) ?? logits
+            if logits.dtype == .bfloat16 {
+                logits = logits.asType(.float32)
+            }
+
+            let allowedIndices = MLXArray(allowedTokens.map { UInt32($0) })
+            let maskedLogits = full(logits.shape, values: -Float.infinity)
+            maskedLogits[0..., allowedIndices] = logits[0..., allowedIndices]
+
+            let sampledToken = sampler.sample(logits: maskedLogits)
+            return sampledToken.item(Int.self)
+        }
+    }
+    extension AnyLanguageModel.JSONValue {
+        /// Recursively converts a `JSONValue` to its primitive Swift equivalent.
+        func toSendable() -> any Sendable {
+            switch self {
+            case .string(let s): return s
+            case .int(let i): return i
+            case .double(let d): return d
+            case .bool(let b): return b
+            case .null: return NSNull()
+            case .array(let arr): return arr.map { $0.toSendable() }
+            case .object(let obj): return obj.mapValues { $0.toSendable() }
+            }
+        }
+    }
+#endif  // MLX
