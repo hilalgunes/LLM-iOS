@@ -6,6 +6,14 @@
 	objectVersion = 110;
 	objects = {
 
+/* Begin PBXTargetDependency section */
+		C10000000000000000000006 = {isa = PBXTargetDependency; target = BDCE4A9D30776AB900E8452C; targetProxy = C10000000000000000000005; };
+/* End PBXTargetDependency section */
+
+/* Begin PBXContainerItemProxy section */
+		C10000000000000000000005 = {isa = PBXContainerItemProxy; containerPortal = BDCE4A9630776AB900E8452C; proxyType = 1; remoteGlobalIDString = BDCE4A9D30776AB900E8452C; remoteInfo = LLM; };
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXBuildFile section */
 		A10000000000000000000001 /* AnyLanguageModel in Frameworks */ = {isa = PBXBuildFile; productRef = A10000000000000000000002 /* AnyLanguageModel */; };
 		A20000000000000000000001 /* MLXAudioTTS in Frameworks */ = {isa = PBXBuildFile; productRef = A20000000000000000000002 /* MLXAudioTTS */; };
@@ -23,6 +31,7 @@
 
 /* Begin PBXFileReference section */
 		BDCE4A9E30776AB900E8452C /* LLM.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LLM.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		C10000000000000000000001 = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = LLMTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -31,6 +40,7 @@
 			path = LLM;
 			sourceTree = "<group>";
 		};
+		C10000000000000000000002 = {isa = PBXFileSystemSynchronizedRootGroup; path = LLMTests; sourceTree = "<group>"; };
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -51,6 +61,7 @@
 				BDCE4AC330776ABA00E8452C /* onnxruntime in Frameworks */,
 			);
 		};
+		C10000000000000000000004 = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
@@ -58,6 +69,7 @@
 			isa = PBXGroup;
 			children = (
 				BDCE4AA030776AB900E8452C /* LLM */,
+                C10000000000000000000002 /* LLMTests */,
 				BDCE4A9F30776AB900E8452C /* Products */,
 			);
 			sourceTree = "<group>";
@@ -66,6 +78,7 @@
 			isa = PBXGroup;
 			children = (
 				BDCE4A9E30776AB900E8452C /* LLM.app */,
+                C10000000000000000000001 /* LLMTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -105,6 +118,18 @@
 			productReference = BDCE4A9E30776AB900E8452C /* LLM.app */;
 			productType = "com.apple.product-type.application";
 		};
+		C10000000000000000000007 = {
+            isa = PBXNativeTarget;
+            buildConfigurationList = C10000000000000000000008;
+            buildPhases = (C10000000000000000000003, C10000000000000000000004);
+            buildRules = ();
+            dependencies = (C10000000000000000000006);
+            fileSystemSynchronizedGroups = (C10000000000000000000002);
+            name = LLMTests;
+            productName = LLMTests;
+            productReference = C10000000000000000000001;
+            productType = "com.apple.product-type.bundle.unit-test";
+        };
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -144,6 +169,7 @@
 			projectRoot = "";
 			targets = (
 				BDCE4A9D30776AB900E8452C /* LLM */,
+                C10000000000000000000007 /* LLMTests */,
 			);
 		};
 /* End PBXProject section */
@@ -162,6 +188,7 @@
 			files = (
 			);
 		};
+		C10000000000000000000003 = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
@@ -373,6 +400,44 @@
 			};
 			name = Release;
 		};
+        C10000000000000000000009 = {
+            isa = XCBuildConfiguration;
+            buildSettings = {
+                BUNDLE_LOADER = "$(TEST_HOST)";
+                CODE_SIGN_STYLE = Automatic;
+                DEVELOPMENT_TEAM = GSRST56A8S;
+                GENERATE_INFOPLIST_FILE = YES;
+                IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+                LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks";
+                PRODUCT_BUNDLE_IDENTIFIER = com.xcode.LLMTests;
+                PRODUCT_NAME = "$(TARGET_NAME)";
+                SDKROOT = iphoneos;
+                SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+                SWIFT_VERSION = 5.0;
+                TARGETED_DEVICE_FAMILY = "1,2";
+                TEST_HOST = "$(BUILT_PRODUCTS_DIR)/LLM.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/LLM";
+            };
+            name = Debug;
+        };
+        C1000000000000000000000A = {
+            isa = XCBuildConfiguration;
+            buildSettings = {
+                BUNDLE_LOADER = "$(TEST_HOST)";
+                CODE_SIGN_STYLE = Automatic;
+                DEVELOPMENT_TEAM = GSRST56A8S;
+                GENERATE_INFOPLIST_FILE = YES;
+                IPHONEOS_DEPLOYMENT_TARGET = 27.0;
+                LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks";
+                PRODUCT_BUNDLE_IDENTIFIER = com.xcode.LLMTests;
+                PRODUCT_NAME = "$(TARGET_NAME)";
+                SDKROOT = iphoneos;
+                SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+                SWIFT_VERSION = 5.0;
+                TARGETED_DEVICE_FAMILY = "1,2";
+                TEST_HOST = "$(BUILT_PRODUCTS_DIR)/LLM.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/LLM";
+            };
+            name = Release;
+        };
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -392,6 +457,7 @@
 			);
 			defaultConfigurationName = Release;
 		};
+		C10000000000000000000008 = {isa = XCConfigurationList; buildConfigurations = (C10000000000000000000009, C1000000000000000000000A); defaultConfigurationName = Release; };
 /* End XCConfigurationList section */
 
 /* Begin XCLocalSwiftPackageReference section */

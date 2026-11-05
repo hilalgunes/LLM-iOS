@@ -1,89 +1,5 @@
 import Foundation
-import AnyLanguageModel
-import MLXFoundationModels
-import HuggingFace
-import MLX
-import MLXHuggingFace
-import MLXLLM
-import MLXLMCommon
 import Observation
-import Tokenizers
-import AVFoundation
-import Speech
-
-enum LocalModelChoice: String, CaseIterable, Identifiable {
-    case apple
-    case qwen
-    case gemma
-    case gemma4
-    case qwen35
-
-    var id: String {
-        repositoryID
-    }
-
-    var repositoryID: String {
-        switch self {
-        case .apple:
-            "apple-system"
-        case .qwen:
-            "mlx-community/Qwen3-0.6B-4bit"
-        case .gemma:
-            "mlx-community/gemma-3-1b-it-4bit"
-        case .gemma4:
-            "over-show/gemma-4-e2b-it-text-only-4bit"
-        case .qwen35:
-            "bobkitchen/Qwen3.5-2B-Text-4bit"
-        }
-    }
-
-    var title: String {
-        switch self {
-        case .apple:
-            "Apple Intelligence · Sistem modeli"
-        case .qwen:
-            "Qwen 3 · 0.6B"
-        case .gemma:
-            "Gemma 3 · 1B"
-        case .gemma4:
-        "Gemma 4 E2B · 4-bit · ~2,5 GB"
-        case .qwen35:
-        "Qwen 3.5 · 2B · 4-bit · ~1 GB"
-        }
-    }
-
-    var shortTitle: String {
-        switch self {
-        case .apple:
-            "Apple Intelligence"
-        case .qwen:
-            "Qwen 3"
-        case .gemma:
-            "Gemma 3"
-        case .gemma4:
-            "Gemma 4 E2B"
-        case .qwen35:
-            "Qwen 3.5 2B"
-        }
-    }
-
-    var configuration: ModelConfiguration {
-        switch self {
-        case .gemma4:
-            ModelConfiguration(
-                id: repositoryID,
-                extraEOSTokens: ["<turn|>"]
-            )
-        case .qwen35:
-            ModelConfiguration(
-                id: repositoryID,
-                extraEOSTokens: ["<|im_end|>"]
-            )
-        case .apple, .qwen, .gemma:
-            ModelConfiguration(id: repositoryID)
-        }
-    }
-}
 
 struct LocalChatMessage: Codable, Identifiable {
     enum Role: String, Codable {
@@ -122,11 +38,12 @@ final class LocalChatModel {
     private var conversationSummary: String?
     private var summarizedMessageCount = 0
 
-    private var loadedModelID: String?
-    private var modelContainer: ModelContainer?
-    private var session: AnyLanguageModel.LanguageModelSession?
-    private var nativeModel: MLXFoundationModels.MLXLanguageModel?
-    private var pendingEviction: Task<Void, Never>?
+    private let modelSession: any ModelSessionServing
+
+    init(modelSession: (any ModelSessionServing)? = nil) {
+        self.modelSession = modelSession ?? LocalModelSessionService()
+    }
+
     private weak var historyStore: ConversationHistoryStore?
     private var activeThreadID: UUID?
 
@@ -134,7 +51,7 @@ final class LocalChatModel {
         guard model != selectedModel, !isBusy else { return }
         selectedModel = model
         persistThread()
-        session = nil
+        modelSession.resetConversation()
         downloadProgress = 0
     }
 
@@ -180,7 +97,7 @@ final class LocalChatModel {
         messages = thread.messages
         conversationSummary = thread.summary
         summarizedMessageCount = thread.summarizedMessageCount
-        session = nil
+        modelSession.resetConversation()
         unloadModel()
         historyStore?.setActiveThread(thread.id)
     }
@@ -199,23 +116,14 @@ final class LocalChatModel {
 
     func unloadModel() {
         guard !isBusy else { return }
-        session = nil
-        let previousEviction = pendingEviction
-        let modelToEvict = nativeModel
-        nativeModel = nil
-        pendingEviction = Task {
-            await previousEviction?.value
-            await modelToEvict?.evict()
-        }
-        modelContainer = nil
-        loadedModelID = nil
+        modelSession.unload()
         downloadProgress = 0
     }
 
     func releaseModelForSpeech() async {
-        unloadModel()
-        await pendingEviction?.value
-        Memory.clearCache()
+        guard !isBusy else { return }
+        await modelSession.releaseForSpeech()
+        downloadProgress = 0
     }
 
     func send(_ prompt: String, onToken: (String) -> Void = { _ in }) async -> ChatGenerationResult? {
@@ -297,7 +205,7 @@ final class LocalChatModel {
             isBusy = false
             isLoadingModel = false
             isGenerating = false
-            session = nil
+            modelSession.resetConversation()
         }
 
         do {
@@ -328,67 +236,11 @@ final class LocalChatModel {
     }
 
     private func prepareSession(startFreshSession: Bool = false) async throws {
-        await pendingEviction?.value
-        if selectedModel == .apple {
-            if modelContainer != nil { unloadModel(); await pendingEviction?.value }
-            let model = AnyLanguageModel.SystemLanguageModel.default
-            guard model.isAvailable else { throw LocalChatError.systemModelUnavailable }
-            if startFreshSession || session == nil {
-                session = AnyLanguageModel.LanguageModelSession(
-                    model: model,
-                    instructions: "Türkçe konuşan, açık ve yardımcı bir asistansın."
-                )
-            }
-            return
+        isLoadingModel = true
+        defer { isLoadingModel = false }
+        try await modelSession.prepare(model: selectedModel, startFreshSession: startFreshSession) { [weak self] progress in
+            self?.downloadProgress = progress
         }
-        if loadedModelID != selectedModel.id {
-            unloadModel()
-            await pendingEviction?.value
-            isLoadingModel = true
-            downloadProgress = 0
-
-            let loadedContainer = try await loadModelContainer(
-                from: #hubDownloader(),
-                using: #huggingFaceTokenizerLoader(),
-                configuration: selectedModel.configuration,
-                progressHandler: { [weak self] progress in
-                    let fractionCompleted = progress.fractionCompleted
-                    guard let self else { return }
-                    Task { @MainActor in
-                        self.downloadProgress = min(max(fractionCompleted, 0), 1)
-                    }
-                }
-            )
-
-            modelContainer = loadedContainer
-            loadedModelID = selectedModel.id
-        }
-
-        if startFreshSession || session == nil {
-            guard let modelContainer else {
-                throw LocalChatError.sessionUnavailable
-            }
-            let model = MLXFoundationModels.MLXLanguageModel(
-                configuration: selectedModel.configuration,
-                capabilities: [],
-                weightsLocation: { id in
-                    let cache = HubCache.default
-                    guard let repo = Repo.ID(rawValue: id) else { return cache.cacheDirectory }
-                    if let commit = cache.resolveRevision(repo: repo, kind: .model, ref: "main"),
-                       let snapshot = try? cache.snapshotPath(repo: repo, kind: .model, commitHash: commit) {
-                        return snapshot
-                    }
-                    return cache.repoDirectory(repo: repo, kind: .model)
-                },
-                load: { _, _ in modelContainer }
-            )
-            nativeModel = model
-            session = AnyLanguageModel.LanguageModelSession(
-                model: AnyLanguageModel.FoundationLanguageModel(model),
-                instructions: "Türkçe konuşan, açık ve yardımcı bir asistansın."
-            )
-        }
-        isLoadingModel = false
     }
 
     private func compactOlderHistoryIfNeeded(_ messages: [LocalChatMessage]) async throws {
@@ -417,7 +269,7 @@ final class LocalChatModel {
         let updatedSummary = try await generate(summaryPrompt) { _ in }
         conversationSummary = updatedSummary
         summarizedMessageCount = endIndex
-        session = nil
+        modelSession.resetConversation()
     }
 
     private static func promptWithHistory(
@@ -439,34 +291,12 @@ final class LocalChatModel {
         """
     }
 
-    private func generate(
-        _ prompt: String,
-        onToken: (String) -> Void
-    ) async throws -> String {
-        guard let session else {
-            throw LocalChatError.sessionUnavailable
-        }
-
+    private func generate(_ prompt: String, onToken: (String) -> Void) async throws -> String {
         isGenerating = true
-        var response = ""
-        let options = AnyLanguageModel.GenerationOptions(
-            temperature: 0.6,
-            maximumResponseTokens: selectedModel == .gemma4 ? 256 : 384
-        )
-        for try await snapshot in session.streamResponse(to: prompt, options: options) {
-            let updated = snapshot.content
-            // Session streams cumulative snapshots; the UI and TTS receive only new text.
-            if updated.hasPrefix(response) {
-                let delta = String(updated.dropFirst(response.count))
-                if !delta.isEmpty { onToken(delta) }
-            }
-            response = updated
-        }
-        guard !response.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw LocalChatError.emptyResponse
-        }
-        return response
+        defer { isGenerating = false }
+        return try await modelSession.generate(prompt, model: selectedModel, onToken: onToken)
     }
+
 }
 
 enum LocalChatError: LocalizedError {
