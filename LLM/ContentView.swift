@@ -10,6 +10,7 @@ struct ContentView: View {
     @State private var selectedTab = 0
     @State private var question = ""
     @State private var isSending = false
+    @State private var sendTask: Task<Void, Never>?
     @FocusState private var questionFieldFocused: Bool
     @State private var isShowingHistory = false
     @State private var isShowingThreads = false
@@ -59,6 +60,14 @@ struct ContentView: View {
                         ForEach(chat.messages) { message in
                             MessageBubble(message: message)
                         }
+                    }
+
+                    if chat.canRegenerate && !isSending {
+                        Button(chat.messages.last?.status == .complete ? "Yanıtı yeniden oluştur" : "Tekrar dene") {
+                            guard let prompt = chat.messages.last(where: { $0.role == .user })?.text else { return }
+                            startReply(prompt: prompt, retry: true)
+                        }
+                        .disabled(voice.isRecording || voice.isFinishingRecognition)
                     }
 
                     if chat.isLoadingModel {
@@ -387,15 +396,20 @@ struct ContentView: View {
                     : voice.isRecording ? "Dikteyi bitir" : "Sesle soru sor"
             )
 
-            Button(action: sendQuestion) {
-                Image(systemName: chat.isBusy ? "ellipsis" : "arrow.up")
+            Button {
+                if isSending {
+                    sendTask?.cancel()
+                    voice.stopSpeaking()
+                } else { sendQuestion() }
+            } label: {
+                Image(systemName: isSending ? "stop.fill" : "arrow.up")
                     .font(.system(size: 17, weight: .bold))
                     .foregroundStyle(.white)
                     .frame(width: 46, height: 46)
-                    .background(canSend ? Color.indigo : Color.gray, in: Circle())
+                    .background(isSending || canSend ? Color.indigo : Color.gray, in: Circle())
             }
-            .disabled(!canSend)
-            .accessibilityLabel("Soruyu gönder")
+            .disabled(!isSending && !canSend)
+            .accessibilityLabel(isSending ? "Yanıtı durdur" : "Soruyu gönder")
         }
         .padding(.horizontal, 16)
         .padding(.top, 12)
@@ -408,14 +422,22 @@ struct ContentView: View {
         let prompt = question.trimmingCharacters(in: .whitespacesAndNewlines)
         question = ""
         questionFieldFocused = false
+        startReply(prompt: prompt, retry: false)
+    }
+
+    private func startReply(prompt: String, retry: Bool) {
+        guard !isSending, !chat.isBusy else { return }
         isSending = true
         voice.beginStreamingReply()
-        Task {
-            defer { isSending = false }
+        sendTask = Task {
+            defer { isSending = false; sendTask = nil }
             await voice.waitForSpeechCompletion()
-            if let result = await chat.send(prompt, onToken: { token in
-                voice.appendReplyText(token)
-            }) {
+            guard !Task.isCancelled else { voice.finishStreamingReply(success: false); return }
+            let onToken: (String) -> Void = { voice.appendReplyText($0) }
+            let result = retry
+                ? await chat.regenerate(onToken: onToken)
+                : await chat.send(prompt, onToken: onToken)
+            if let result {
                 voice.finishStreamingReply()
                 history.add(
                     kind: .chat,
@@ -444,7 +466,14 @@ private struct MessageBubble: View {
         HStack {
             if isUser { Spacer(minLength: 40) }
 
-            Text(message.text)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(message.text.isEmpty && message.status != .complete ? "Yanıt tamamlanmadı." : message.text)
+                if message.status == .interrupted {
+                    Text("Durduruldu · Kısmi yanıt saklandı").font(.caption)
+                } else if message.status == .failed {
+                    Text("Yanıt tamamlanamadı").font(.caption)
+                }
+            }
                 .font(.body)
                 .foregroundStyle(isUser ? .white : .primary)
                 .textSelection(.enabled)

@@ -23,19 +23,20 @@ Stash kayıtları yalnızca ilgili yerel depodadır; normal push ile gönderilme
 - [x] Android oturum testleri ve iOS sohbet orkestrasyon testleri eklendi.
 - [x] Android debug derlemesi ve 33 birim testi; iOS 27 simülatör derlemesi, 5 uygulama testi ve imzasız iOS cihaz hedefi derlemesi geçti.
 - [ ] Fiziksel cihazda model seçimi, token akışı, model değişimi ve RAG/ses geçişini kontrol et.
-- [ ] Ayrı commit'leri pushla.
+- [x] Android ilk adım commit’i kullanıcı tarafından pushlandı.
+- [ ] iOS dalını ilk kez `git push -u origin codex/shared-model-sessions` ile gönder (upstream henüz tanımlı değil).
 
-Bu adım ekranları yeniden tasarlamaz. Android model seçimi state'i geçici olarak BenchmarkUiState'te kalır; TestRoute bu state'i ve callback'leri alır. Android RAG kendi motorlarını kullanmaya devam eder; ortak runtime'a geçiş belge aşamasında yapılacak. Mevcut BenchmarkPrompt/BenchmarkModelSelection veri tiplerinin tarafsız adlandırılması da ileriki adımda yapılabilir.
+İlk adım ekranları yeniden tasarlamadı. İkinci adımda Android sohbet/test model seçimi GenerationModelViewModel ve GenerationModelUiState ile benchmark state’inden ayrıldı. Android RAG kendi motorlarını kullanmaya devam eder; ortak runtime'a geçiş belge aşamasında yapılacak. Mevcut BenchmarkPrompt/BenchmarkModelSelection veri tiplerinin tarafsız adlandırılması da ileriki adımda yapılabilir.
 
-İptal, Android'de çağıran coroutine'in, iOS'ta çağıran Task'ın iptaliyle iletilir. Bu servis sözleşmesi, yeni bir kullanıcıya dönük durdur düğmesi eklenmesi anlamına gelmez. Native motorun fiziksel iptal süresi cihaz üzerinde doğrulanmalıdır.
+İptal, Android'de çağıran coroutine'in, iOS'ta çağıran Task'ın iptaliyle iletilir. İkinci adımda sohbet ekranlarına kullanıcıya dönük durdurma düğmesi eklendi. Native motorun fiziksel iptal süresi cihaz üzerinde doğrulanmalıdır.
 
 ## 2. Sohbeti eşitle
 
-- [ ] Android'e sohbet ekranı ve kalıcı sohbet/mesaj deposu ekle.
-- [ ] Model seçimi ve indirme durumunu benchmark ekranından bağımsızlaştır.
-- [ ] İki tarafta cevap durdurma, yeniden deneme ve yeniden üretme davranışlarını tamamla.
-- [ ] Yeni sohbet, sohbet seçme/silme/adlandırma ve uygulama yeniden açılışını doğrula.
-- [ ] Hata ve iptal durumlarında kısmi cevabın nasıl saklandığını ortaklaştır.
+- [x] Android'e sohbet ekranı ve kalıcı sohbet/mesaj deposu ekle.
+- [x] Model seçimi ve indirme durumunu benchmark ekranından bağımsızlaştır.
+- [x] İki tarafta cevap durdurma, yeniden deneme ve yeniden üretme davranışlarını tamamla.
+- [x] Yeni sohbet, sohbet seçme/silme/adlandırma ve uygulama yeniden açılışını doğrula.
+- [x] Hata ve iptal durumlarında kısmi cevabın nasıl saklandığını ortaklaştır.
 
 ## 3. Modelleri eşitle
 
@@ -68,3 +69,25 @@ iOS: `xcodebuild -project LLM.xcodeproj -scheme LLM -destination 'platform=iOS S
 Ek olarak `generic/platform=iOS` hedefinde `CODE_SIGNING_ALLOWED=NO build` başarılı.
 
 Testler gerçek model ağırlıkları indirmez. Fiziksel cihazdaki native inference performansı, MLX/Apple model geçişi ve mikrofon/TTS bu testlerle doğrulanmış sayılmaz.
+
+## Adım 2 — sohbet ve geçmiş (10 Kasım 2026)
+
+- Android'in başlangıç ekranına Sohbet eklendi. Geçmiş, yeni sohbet, adlandırma, silme, metin seçme/kopyalama ve yeniden üretme bulunuyor.
+- Sohbet ve Test için model seçimi/indirme state'i benchmark'tan ayrıldı. Benchmark ayarları kendi ekranında bağımsız kaldı.
+- Android konuşmaları model kimliğiyle atomik JSON dosyasında saklanıyor. Yazımlar sıralı; üretim sırasında yaklaşık saniyelik kayıt noktaları ve işlem bitiminde son kayıt var.
+- İki platformda iptal/hata sonrası kısmi yanıt ve durum bilgisi korunuyor. Yeniden üretme son kullanıcı sorusunu çoğaltmadan son yanıtı değiştiriyor. Yeni soruların bağlamına tamamlanmamış yanıtlar katılmıyor.
+- iOS mesaj kayıtlarına durum alanı eklendi; eski kayıtlar bu alan olmadan da okunuyor. Yarım kalmış üretim yeniden açılışta kesilmiş olarak işaretleniyor.
+- Android model başına kalıcı KV-cache iddiası yok: son 8 tamamlanmış mesajdan metin bağlamı oluşturuluyor; mesaj başına 2000 karakter sınırı var. iOS mevcut özetleme davranışını koruyor. Uzun konuşmaların platformlar arası bağlam bütçesi ileride ortaklaştırılacak.
+
+Doğrulama:
+
+- Android: `:app:testDebugUnitTest :app:assembleDebug :app:assembleDebugAndroidTest --offline` başarılı; toplam 39 birim testi, 0 hata.
+- Pixel 10 Pro emülatörü: `ChatScreenTest` (geçmişten açma/adlandırma/silme) ve `EmbeddingNavigationTest` başarılı; 2 ekran testi, 0 hata.
+- iOS 27 simülatörü: LLMTests altında 8 test, 0 hata. Eski mesaj şeması, yeniden üretmede soru çoğalmaması, geçmişin tekrar yüklenmesi ve kısmi yanıt saklama dahil.
+- Gerçek model ağırlıklarıyla fiziksel cihazda üretim, iptal gecikmesi ve TTS ile birlikte kullanım bu testlerde ölçülmedi.
+
+Sıradaki küçük adım: modeller ekranında indirme/depolama yönetimi ve model yeteneklerinin görünür olması. Mevcut Android RAG motorlarını ortak runtime'a taşıma işi belge aşamasında devam edecek.
+
+### Cihaz kontrolünde görülen ek iş
+
+Pixel 10 Pro'nun 16 KB sayfa boyutlu emülatöründe uygulama açılışında native kütüphaneler için hizalama/uyumluluk uyarısı görüldü. Uygulama uyumluluk modunda açıldı ve sohbet görünümü kontrol edildi. Bu adım native kütüphaneleri değiştirmedi. Sürüm hazırlığından önce bağımlılıkların ve JNI derlemesinin 16 KB uyumluluğu ayrı bir adımda ele alınmalı.

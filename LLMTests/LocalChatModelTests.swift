@@ -29,7 +29,8 @@ final class LocalChatModelTests: XCTestCase {
         XCTAssertFalse(chat.isBusy)
         XCTAssertFalse(chat.isLoadingModel)
         XCTAssertNotNil(chat.errorMessage)
-        XCTAssertEqual(chat.messages.count, 1)
+        XCTAssertEqual(chat.messages.count, 2)
+        XCTAssertEqual(chat.messages.last?.status, .failed)
         session.failPreparation = false
         let retry = await chat.send("Tekrar")
         XCTAssertEqual(retry?.text, "Merhaba")
@@ -63,10 +64,49 @@ final class LocalChatModelTests: XCTestCase {
         XCTAssertNil(result)
         XCTAssertFalse(chat.isBusy)
         XCTAssertFalse(chat.isGenerating)
+        XCTAssertEqual(chat.messages.last?.text, "Kısmi yanıt")
+        XCTAssertEqual(chat.messages.last?.status, .interrupted)
+        XCTAssertNil(chat.errorMessage)
         session.waitForCancellation = false
         session.onStart = nil
         let next = await chat.send("Yeni soru")
         XCTAssertEqual(next?.text, "Merhaba")
+    }
+
+    func testRegenerationReplacesReplyWithoutDuplicatingQuestion() async {
+        let session = StubModelSession()
+        let chat = LocalChatModel(modelSession: session)
+        chat.select(.apple)
+        _ = await chat.send("Soru")
+        _ = await chat.regenerate()
+        XCTAssertEqual(chat.messages.count, 2)
+        XCTAssertEqual(chat.messages.filter { $0.role == .user }.map(\.text), ["Soru"])
+        XCTAssertEqual(chat.messages.last?.status, .complete)
+    }
+
+    func testOldMessageFormatStillDecodes() throws {
+        let id = UUID()
+        let data = Data("{\"id\":\"\(id)\",\"role\":\"assistant\",\"text\":\"Eski yanıt\"}".utf8)
+        let message = try JSONDecoder().decode(LocalChatMessage.self, from: data)
+        XCTAssertEqual(message.status, .complete)
+        XCTAssertEqual(message.text, "Eski yanıt")
+    }
+
+    func testHistoryRestoresThreadAndMarksUnfinishedReply() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let history = ConversationHistoryStore(directory: directory)
+        let thread = history.createThread(modelID: LocalModelChoice.apple.rawValue)
+        history.updateThread(id: thread.id, modelID: thread.modelID, messages: [
+            LocalChatMessage(role: .user, text: "Soru"),
+            LocalChatMessage(role: .assistant, text: "Yarım", status: .generating)
+        ], summary: nil, summarizedMessageCount: 0)
+        let restored = ConversationHistoryStore(directory: directory)
+        XCTAssertEqual(restored.activeThreadID, thread.id)
+        XCTAssertEqual(restored.threads.first?.modelID, LocalModelChoice.apple.rawValue)
+        XCTAssertEqual(restored.threads.first?.messages.last?.status, .interrupted)
+        XCTAssertEqual(restored.threads.first?.messages.last?.text, "Yarım")
     }
 
     func testModelReleaseIsDelegatedToSession() async {
@@ -97,6 +137,7 @@ private final class StubModelSession: ModelSessionServing {
     }
     func generate(_ prompt: String, model: LocalModelChoice, onToken: (String) -> Void) async throws -> String {
         prompts.append(prompt)
+        if waitForCancellation { onToken("Kısmi yanıt") }
         onStart?()
         if waitForCancellation { try await Task.sleep(for: .seconds(60)) }
         try Task.checkCancellation()

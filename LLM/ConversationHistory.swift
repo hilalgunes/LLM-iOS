@@ -86,8 +86,8 @@ final class ConversationHistoryStore {
     private let fileURL: URL
     private let threadsURL: URL
 
-    init() {
-        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+    init(directory: URL? = nil) {
+        let documentsURL = directory ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         fileURL = documentsURL.appendingPathComponent("conversation-history.json")
         threadsURL = documentsURL.appendingPathComponent("chat-threads.json")
         do {
@@ -102,7 +102,15 @@ final class ConversationHistoryStore {
         do {
             let data = try Data(contentsOf: threadsURL)
             let saved = try JSONDecoder().decode(ChatThreadsArchive.self, from: data)
-            threads = saved.threads.sorted { $0.updatedAt > $1.updatedAt }
+            threads = saved.threads.map { thread in
+                var restored = thread
+                restored.messages = thread.messages.map { message in
+                    var restoredMessage = message
+                    if restoredMessage.status == .generating { restoredMessage.status = .interrupted }
+                    return restoredMessage
+                }
+                return restored
+            }.sorted { $0.updatedAt > $1.updatedAt }
             activeThreadID = saved.activeThreadID.flatMap { id in
                 threads.contains(where: { $0.id == id }) ? id : nil
             } ?? threads.first?.id

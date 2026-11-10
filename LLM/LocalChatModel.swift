@@ -7,14 +7,26 @@ struct LocalChatMessage: Codable, Identifiable {
         case assistant
     }
 
+    enum Status: String, Codable { case complete, generating, interrupted, failed }
     let id: UUID
     let role: Role
     var text: String
+    var status: Status
 
-    init(id: UUID = UUID(), role: Role, text: String) {
+    private enum CodingKeys: String, CodingKey { case id, role, text, status }
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        role = try values.decode(Role.self, forKey: .role)
+        text = try values.decode(String.self, forKey: .text)
+        status = try values.decodeIfPresent(Status.self, forKey: .status) ?? .complete
+    }
+
+    init(id: UUID = UUID(), role: Role, text: String, status: Status = .complete) {
         self.id = id
         self.role = role
         self.text = text
+        self.status = status
     }
 }
 
@@ -126,6 +138,16 @@ final class LocalChatModel {
         downloadProgress = 0
     }
 
+    var canRegenerate: Bool { !isBusy && messages.contains { $0.role == .user } }
+
+    func regenerate(onToken: (String) -> Void = { _ in }) async -> ChatGenerationResult? {
+        guard canRegenerate, let lastUser = messages.lastIndex(where: { $0.role == .user }) else { return nil }
+        let prompt = messages[lastUser].text
+        messages = Array(messages.prefix(lastUser))
+        modelSession.resetConversation()
+        return await send(prompt, onToken: onToken)
+    }
+
     func send(_ prompt: String, onToken: (String) -> Void = { _ in }) async -> ChatGenerationResult? {
         guard !isBusy else { return nil }
         errorMessage = nil
@@ -141,8 +163,10 @@ final class LocalChatModel {
         var firstResponseSeconds: Double?
         let answerID = UUID()
         messages.append(LocalChatMessage(role: .user, text: prompt))
-        messages.append(LocalChatMessage(id: answerID, role: .assistant, text: ""))
-        let priorMessages = Array(messages.dropLast(2))
+        messages.append(LocalChatMessage(id: answerID, role: .assistant, text: "", status: .generating))
+        let priorMessages = Array(messages.dropLast(2)).filter { $0.status == .complete }
+        persistThread()
+        var lastCheckpoint = ProcessInfo.processInfo.systemUptime
         isBusy = true
         defer {
             isBusy = false
@@ -167,10 +191,15 @@ final class LocalChatModel {
                 }
                 messages[answerIndex].text += token
                 onToken(token)
+                if ProcessInfo.processInfo.systemUptime - lastCheckpoint >= 1 {
+                    persistThread()
+                    lastCheckpoint = ProcessInfo.processInfo.systemUptime
+                }
             }
 
             if let answerIndex = messages.firstIndex(where: { $0.id == answerID }) {
                 messages[answerIndex].text = answer
+                messages[answerIndex].status = .complete
             }
             persistThread()
             return ChatGenerationResult(
@@ -179,9 +208,13 @@ final class LocalChatModel {
                 firstResponseSeconds: firstResponseSeconds ?? ProcessInfo.processInfo.systemUptime - startedAt
             )
         } catch {
-            messages.removeAll { $0.id == answerID }
+            let cancelled = error is CancellationError || Task.isCancelled
+            if let index = messages.firstIndex(where: { $0.id == answerID }) {
+                messages[index].status = cancelled ? .interrupted : .failed
+            }
+            modelSession.resetConversation()
             persistThread()
-            errorMessage = error.localizedDescription
+            errorMessage = cancelled ? nil : error.localizedDescription
             return nil
         }
     }
