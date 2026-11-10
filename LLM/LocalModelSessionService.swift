@@ -26,6 +26,7 @@ final class LocalModelSessionService: ModelSessionServing {
     private var nativeModel: MLXFoundationModels.MLXLanguageModel?
     private var pendingEviction: Task<Void, Never>?
     private var isOperating = false
+    private var needsMLXCacheCleanup = false
 
     func resetConversation() {
         guard !isOperating else { return }
@@ -54,7 +55,10 @@ final class LocalModelSessionService: ModelSessionServing {
         guard !isOperating else { return }
         unload()
         await pendingEviction?.value
-        Memory.clearCache()
+        if needsMLXCacheCleanup {
+            MLXRuntimeSupport.clearCache()
+            needsMLXCacheCleanup = false
+        }
     }
 
     func prepare(model selectedModel: LocalModelChoice, startFreshSession: Bool, onProgress: @escaping @MainActor (Double) -> Void) async throws {
@@ -85,11 +89,13 @@ final class LocalModelSessionService: ModelSessionServing {
             }
             return
         }
+        try MLXRuntimeSupport.requireSupported()
         if loadedModelID != selectedModel.id {
             releaseResources()
             await pendingEviction?.value
             onProgress(0)
 
+            needsMLXCacheCleanup = true
             let loadedContainer = try await loadModelContainer(
                 from: #hubDownloader(),
                 using: #huggingFaceTokenizerLoader(),

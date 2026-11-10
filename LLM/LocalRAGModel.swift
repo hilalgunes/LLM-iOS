@@ -148,9 +148,10 @@ final class LocalRAGModel {
     }
 
     func unloadEmbedder() {
+        let hadModel = embedder != nil
         embedder = nil
         loadedEmbeddingID = nil
-        Memory.clearCache()
+        if hadModel { MLXRuntimeSupport.clearCache() }
     }
 
     func importDocuments(from urls: [URL]) async {
@@ -213,7 +214,9 @@ final class LocalRAGModel {
     }
 
     func indexDocuments(using chat: LocalChatModel) async {
-        guard !isBusy, !chat.isBusy, hasUnembeddedChunks else { return }
+        guard !isBusy, !chat.isBusy else { return }
+        guard requireEmbeddingRuntime() else { return }
+        guard hasUnembeddedChunks else { return }
         errorMessage = nil
         isProcessing = true
         progress = 0
@@ -226,7 +229,7 @@ final class LocalRAGModel {
 
         do {
             chat.unloadModel()
-            Memory.clearCache()
+            MLXRuntimeSupport.clearCache()
             try await loadEmbedderIfNeeded()
             let pendingIndices = chunks.indices.filter { chunks[$0].embedding == nil }
             for (completed, index) in pendingIndices.enumerated() {
@@ -236,7 +239,7 @@ final class LocalRAGModel {
                 progress = Double(completed + 1) / Double(pendingIndices.count)
                 if completed.isMultiple(of: 8) {
                     try persistIndex()
-                    Memory.clearCache()
+                    MLXRuntimeSupport.clearCache()
                 }
             }
             try persistIndex()
@@ -257,6 +260,7 @@ final class LocalRAGModel {
         history: ConversationHistoryStore
     ) async {
         guard !isBusy, !chat.isBusy else { return }
+        guard requireEmbeddingRuntime() else { return }
         guard indexedChunkCount > 0 else {
             errorMessage = "Önce belge ekleyip embedding indeksini oluşturun."
             return
@@ -275,7 +279,7 @@ final class LocalRAGModel {
 
         do {
             chat.unloadModel()
-            Memory.clearCache()
+            MLXRuntimeSupport.clearCache()
             try await loadEmbedderIfNeeded()
             let queryVector = try await makeEmbedding(for: question, isQuery: true)
             let matches = chunks
@@ -326,6 +330,7 @@ final class LocalRAGModel {
         using chat: LocalChatModel
     ) async {
         guard !isBusy, !chat.isBusy else { return }
+        guard requireEmbeddingRuntime() else { return }
         guard choices.count == 2, choices[0] != choices[1] else {
             errorMessage = "Karşılaştırmak için iki farklı embedding modeli seçin."
             return
@@ -354,7 +359,7 @@ final class LocalRAGModel {
 
         do {
             chat.unloadModel()
-            Memory.clearCache()
+            MLXRuntimeSupport.clearCache()
 
             var comparisons: [RAGEmbeddingComparison] = []
             for (index, choice) in choices.enumerated() {
@@ -422,7 +427,16 @@ final class LocalRAGModel {
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
+    private func requireEmbeddingRuntime() -> Bool {
+        guard MLXRuntimeSupport.isSupported else {
+            errorMessage = LocalChatError.simulatorNotSupported.localizedDescription
+            return false
+        }
+        return true
+    }
+
     private func loadEmbedderIfNeeded(for choice: RAGEmbeddingChoice? = nil) async throws {
+        try MLXRuntimeSupport.requireSupported()
         let choice = choice ?? selectedEmbedding
         guard loadedEmbeddingID != choice.id else { return }
         unloadEmbedder()
