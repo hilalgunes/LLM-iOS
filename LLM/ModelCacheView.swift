@@ -16,11 +16,15 @@ struct ModelCacheView: View {
             List {
                 Section {
                     HStack {
-                        Label("Toplam indirilen model", systemImage: "internaldrive.fill")
+                        Label("Modellerin kapladığı alan", systemImage: "internaldrive.fill")
                         Spacer()
                         Text(totalSize.formattedStorageSize)
                             .font(.subheadline.monospacedDigit().weight(.semibold))
                     }
+                    Text("Boş alan: \(manager.freeBytes.formattedStorageSize)")
+                        .font(.caption)
+                    Text("MLX · Sohbet ve embedding modelleri. Apple sistem modeli iOS tarafından yönetilir. Çalıştırma için yeterli bellek gerekir.")
+                        .font(.caption).foregroundStyle(.secondary)
                     Text("Kullanılan alan Hugging Face model önbelleğinden hesaplanır. Silinen model gerektiğinde tekrar indirilebilir.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -35,9 +39,28 @@ struct ModelCacheView: View {
                                     VStack(alignment: .leading, spacing: 4) {
                                         Text(model.title)
                                             .font(.subheadline.weight(.medium))
+                                        if chat.selectedModel.repositoryID == model.id || rag.selectedEmbedding.repositoryID == model.id {
+                                            Text("Seçili").font(.caption).foregroundStyle(.tint)
+                                        }
                                         Text(manager.sizes[model.id, default: 0].formattedStorageSize)
                                             .font(.caption.monospacedDigit())
                                             .foregroundStyle(.secondary)
+                                        Text(manager.readyModels.contains(model.id) ? "Gerekli dosyalar mevcut" : manager.sizes[model.id, default: 0] > 0 ? "Eksik veya doğrulanmamış dosyalar" : "İndirilmedi")
+                                            .font(.caption)
+                                        if let notice = manager.notices[model.id] { Text(notice).font(.caption) }
+                                        if manager.activeModelID == model.id {
+                                            if manager.isDeleting { Text("Siliniyor…").font(.caption) }
+                                            else {
+                                                ProgressView(value: manager.progress)
+                                                Button(manager.isCancelling ? "İptal ediliyor…" : "İptal") { manager.cancelDownload() }
+                                                    .disabled(manager.isCancelling)
+                                            }
+                                        } else {
+                                            Button(manager.readyModels.contains(model.id) ? "Dosyaları denetle" : "İndir / tekrar dene") {
+                                                manager.download(model, chat: chat, rag: rag)
+                                            }
+                                            .disabled(manager.activeModelID != nil || chat.isBusy || rag.isBusy)
+                                        }
                                     }
                                     Spacer()
                                     if manager.sizes[model.id, default: 0] > 0 {
@@ -48,6 +71,7 @@ struct ModelCacheView: View {
                                                 .frame(width: 36, height: 36)
                                                 .background(.red.opacity(0.1), in: Circle())
                                         }
+                                        .disabled(manager.activeModelID != nil || chat.isBusy || rag.isBusy)
                                         .accessibilityLabel("\(model.title) modelini sil")
                                     } else {
                                         Text("İndirilmedi")
@@ -55,6 +79,7 @@ struct ModelCacheView: View {
                                             .foregroundStyle(.tertiary)
                                     }
                                 }
+                                .buttonStyle(.borderless)
                                 .padding(.vertical, 3)
                             }
                         }
@@ -68,11 +93,12 @@ struct ModelCacheView: View {
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
                 }
             }
-            .navigationTitle("İndirilen modeller")
+            .interactiveDismissDisabled(manager.isDeleting)
+            .navigationTitle("Modeller")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Bitti") { dismiss() }
+                    Button("Bitti") { dismiss() }.disabled(manager.isDeleting)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
@@ -80,7 +106,7 @@ struct ModelCacheView: View {
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
-                    .disabled(manager.isRefreshing)
+                    .disabled(manager.isRefreshing || manager.activeModelID != nil)
                 }
             }
             .confirmationDialog(

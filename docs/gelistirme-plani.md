@@ -24,7 +24,7 @@ Stash kayıtları yalnızca ilgili yerel depodadır; normal push ile gönderilme
 - [x] Android debug derlemesi ve 33 birim testi; iOS 27 simülatör derlemesi, 5 uygulama testi ve imzasız iOS cihaz hedefi derlemesi geçti.
 - [ ] Fiziksel cihazda model seçimi, token akışı, model değişimi ve RAG/ses geçişini kontrol et.
 - [x] Android ilk adım commit’i kullanıcı tarafından pushlandı.
-- [ ] iOS dalını ilk kez `git push -u origin codex/shared-model-sessions` ile gönder (upstream henüz tanımlı değil).
+- [x] iOS dalı kullanıcı tarafından pushlandı; upstream tanımlı.
 
 İlk adım ekranları yeniden tasarlamadı. İkinci adımda Android sohbet/test model seçimi GenerationModelViewModel ve GenerationModelUiState ile benchmark state’inden ayrıldı. Android RAG kendi motorlarını kullanmaya devam eder; ortak runtime'a geçiş belge aşamasında yapılacak. Mevcut BenchmarkPrompt/BenchmarkModelSelection veri tiplerinin tarafsız adlandırılması da ileriki adımda yapılabilir.
 
@@ -40,9 +40,11 @@ Stash kayıtları yalnızca ilgili yerel depodadır; normal push ile gönderilme
 
 ## 3. Modelleri eşitle
 
-- [ ] İndirme ilerlemesi, iptal/yeniden deneme ve silme akışlarını tamamla.
-- [ ] Model yeteneklerini (üretim, embedding, platform/runtime desteği) açıkça tanımla.
-- [ ] Cihaz uyumluluğu ve depolama bilgisini kullanıcıya göster.
+- [x] Android sohbet ve iOS sohbet/embedding modellerinde indirme, iptal, yeniden deneme ve silme kontrollerini ekle.
+- [ ] Android eski benchmark/RAG model kataloglarını aynı yönetim akışına taşı.
+- [x] Yönetim ekranlarında model amacı ve runtime bilgisini göster.
+- [x] Kullanılan disk alanı, boş alan ve eksik dosya durumunu göster.
+- [ ] Fiziksel cihaz belleği ve native runtime uyumluluğunu ölçerek model bazında öneri sun.
 
 ## 4. Belgeleri eşitle
 
@@ -91,3 +93,15 @@ Sıradaki küçük adım: modeller ekranında indirme/depolama yönetimi ve mode
 ### Cihaz kontrolünde görülen ek iş
 
 Pixel 10 Pro'nun 16 KB sayfa boyutlu emülatöründe uygulama açılışında native kütüphaneler için hizalama/uyumluluk uyarısı görüldü. Uygulama uyumluluk modunda açıldı ve sohbet görünümü kontrol edildi. Bu adım native kütüphaneleri değiştirmedi. Sürüm hazırlığından önce bağımlılıkların ve JNI derlemesinin 16 KB uyumluluğu ayrı bir adımda ele alınmalı.
+
+## Adım 3 — model yönetimi (10 Kasım 2026)
+
+- Android sohbet model seçicisi yönetim ekranına dönüştürüldü. Runtime, tahmini boyut, diskte kaplanan alan, boş alan, seçili/hazır/eksik durumları ve silme onayı eklendi. Sohbet geçmişi model silindiğinde korunur.
+- Android indirme iptalinde dosya işi tamamlanmadan yeni indirme/silme başlatılmaz. Silme ortak runtime kilidi altında, sıcak oturum kapatıldıktan sonra yapılır; aktif benchmark, test ve RAG işlemlerinde engellenir.
+- iOS sohbet ve embedding modellerine Hugging Face önbelleğini kullanan indirme, ilerleme, iptal ve yeniden deneme eklendi. Yönetim sırasında sohbet/RAG işlemleri engellenir; silme native oturumun kaynak bırakmasını bekler. Apple sistem modeli iOS tarafından yönetilir.
+- Diskte dosya bulunması tek başına hazır model sayılmaz. Android zorunlu dosyaların boyutunu; iOS aktif snapshot içindeki config, tokenizer ve ağırlıkları (indeks varsa tüm shard dosyalarını) kontrol eder. Bu kontrol modelin cihazda çalışacağı veya dosya içeriğinin geçerli olduğu garantisi değildir.
+- Android eski benchmark/RAG kataloglarının birleşmesi, fiziksel cihaz bellek önerileri ve 16 KB native uyumluluk ayrı adımlardır. iOS önbellek tarama/silme işleri hâlâ ana aktörde; büyük önbelleklerde arka plana taşıma açık iştir.
+
+Doğrulama: Android debug derlemesi ve 43 birim testi başarılı. Emülatörde sohbet geçmişi ve yeni model yönetimi penceresini kapsayan 1 ekran testi başarılı. Gerçek model indirme ve fiziksel cihazdaki iptal gecikmesi henüz denenmedi.
+
+iOS: simülatörde 12 test, 0 hata. Eksik blob, tek dosyalı snapshot, eksik/boş shard, model yönetimi sırasında sohbet engeli ve kaynak bırakma delegasyonu doğrulandı. İlk kurulumdaki boş disk alanı düzeltmesinden sonra ayrıca derleme yapıldı. Canlı ağ kesintisi/yeniden başlatma ve gerçek MLX ağırlıklarıyla indirme/silme henüz cihazda denenmedi.

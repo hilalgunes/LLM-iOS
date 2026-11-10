@@ -86,7 +86,9 @@ struct RAGEmbeddingComparison: Identifiable {
 final class LocalRAGModel {
     var selectedEmbedding: RAGEmbeddingChoice = .multilingualE5
     var chunks: [RAGChunk] = []
-    var isBusy = false
+    private var isProcessing = false
+    var isManagingModels = false
+    var isBusy: Bool { isProcessing || isManagingModels }
     var progress = 0.0
     var statusMessage: String?
     var errorMessage: String?
@@ -155,10 +157,10 @@ final class LocalRAGModel {
         errorMessage = nil
         answer = ""
         sources = []
-        isBusy = true
+        isProcessing = true
         statusMessage = "Belgeler okunuyor…"
         defer {
-            isBusy = false
+            isProcessing = false
             statusMessage = nil
             progress = 0
         }
@@ -212,11 +214,11 @@ final class LocalRAGModel {
     func indexDocuments(using chat: LocalChatModel) async {
         guard !isBusy, !chat.isBusy, hasUnembeddedChunks else { return }
         errorMessage = nil
-        isBusy = true
+        isProcessing = true
         progress = 0
         defer {
             unloadEmbedder()
-            isBusy = false
+            isProcessing = false
             statusMessage = nil
             progress = 0
         }
@@ -262,11 +264,11 @@ final class LocalRAGModel {
         answer = ""
         sources = []
         let startedAt = ProcessInfo.processInfo.systemUptime
-        isBusy = true
+        isProcessing = true
         statusMessage = "İlgili belge parçaları aranıyor…"
         defer {
             unloadEmbedder()
-            isBusy = false
+            isProcessing = false
             statusMessage = nil
         }
 
@@ -340,11 +342,11 @@ final class LocalRAGModel {
 
         errorMessage = nil
         embeddingComparison = []
-        isBusy = true
+        isProcessing = true
         progress = 0
         defer {
             unloadEmbedder()
-            isBusy = false
+            isProcessing = false
             statusMessage = nil
             progress = 0
         }

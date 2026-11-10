@@ -109,6 +109,20 @@ final class LocalChatModelTests: XCTestCase {
         XCTAssertEqual(restored.threads.first?.messages.last?.text, "Yarım")
     }
 
+    func testModelManagementBlocksGenerationAndAwaitsRelease() async {
+        let session = StubModelSession()
+        let chat = LocalChatModel(modelSession: session)
+        chat.isManagingModels = true
+        let blocked = await chat.send("İndirme sırasında soru")
+        XCTAssertNil(blocked)
+        XCTAssertTrue(session.preparedModels.isEmpty)
+        await chat.releaseForModelManagement()
+        XCTAssertEqual(session.speechReleases, 1)
+        XCTAssertTrue(chat.isBusy)
+        chat.isManagingModels = false
+        XCTAssertFalse(chat.isBusy)
+    }
+
     func testModelReleaseIsDelegatedToSession() async {
         let session = StubModelSession()
         let chat = LocalChatModel(modelSession: session)

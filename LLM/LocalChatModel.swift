@@ -41,7 +41,9 @@ struct ChatGenerationResult {
 final class LocalChatModel {
     var selectedModel: LocalModelChoice = .qwen
     var messages: [LocalChatMessage] = []
-    var isBusy = false
+    private var isProcessing = false
+    var isManagingModels = false
+    var isBusy: Bool { isProcessing || isManagingModels }
     var isLoadingModel = false
     var isGenerating = false
     var downloadProgress = 0.0
@@ -132,6 +134,11 @@ final class LocalChatModel {
         downloadProgress = 0
     }
 
+    func releaseForModelManagement() async {
+        await modelSession.releaseForSpeech()
+        downloadProgress = 0
+    }
+
     func releaseModelForSpeech() async {
         guard !isBusy else { return }
         await modelSession.releaseForSpeech()
@@ -167,9 +174,9 @@ final class LocalChatModel {
         let priorMessages = Array(messages.dropLast(2)).filter { $0.status == .complete }
         persistThread()
         var lastCheckpoint = ProcessInfo.processInfo.systemUptime
-        isBusy = true
+        isProcessing = true
         defer {
-            isBusy = false
+            isProcessing = false
             isLoadingModel = false
             isGenerating = false
         }
@@ -233,9 +240,9 @@ final class LocalChatModel {
 
         let requestStartedAt = startedAt ?? ProcessInfo.processInfo.systemUptime
         var firstResponseSeconds: Double?
-        isBusy = true
+        isProcessing = true
         defer {
-            isBusy = false
+            isProcessing = false
             isLoadingModel = false
             isGenerating = false
             modelSession.resetConversation()
