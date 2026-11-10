@@ -5,7 +5,6 @@ import MLXEmbedders
 import MLXHuggingFace
 import MLXLMCommon
 import Observation
-import PDFKit
 import Tokenizers
 
 enum RAGEmbeddingChoice: String, CaseIterable, Identifiable {
@@ -99,6 +98,7 @@ final class LocalRAGModel {
 
     private var embedder: EmbedderModelContainer?
     private var loadedEmbeddingID: String?
+    private let documentReader: any RAGDocumentReading
     private let indexURL: URL
     private let embeddingPreferenceKey = "rag.embeddingModel"
 
@@ -114,7 +114,8 @@ final class LocalRAGModel {
         chunks.contains { $0.embedding == nil }
     }
 
-    init() {
+    init(documentReader: any RAGDocumentReading = RAGDocumentReader()) {
+        self.documentReader = documentReader
         if let storedChoice = UserDefaults.standard.string(forKey: embeddingPreferenceKey),
            let choice = RAGEmbeddingChoice(rawValue: storedChoice) {
             selectedEmbedding = choice
@@ -181,9 +182,9 @@ final class LocalRAGModel {
                 }
                 let storedName = "\(UUID().uuidString).\(url.pathExtension)"
                 let storedURL = sourceDirectory.appendingPathComponent(storedName)
-                let pages = try extractPages(from: url)
-                let pieces = pages.flatMap { page in
-                    Self.split(page.text, maximumLength: 850, overlap: 120).map {
+                let pages = try documentReader.read(from: url)
+                let pieces = try pages.flatMap { page in
+                    try RAGTextChunker.split(page.text, maximumLength: 850, overlap: 120).map {
                         (text: $0, pageNumber: page.pageNumber)
                     }
                 }
@@ -474,54 +475,9 @@ final class LocalRAGModel {
         }
     }
 
-    private func extractPages(from url: URL) throws -> [(text: String, pageNumber: Int?)] {
-        switch url.pathExtension.lowercased() {
-        case "pdf":
-            guard let document = PDFDocument(url: url) else {
-                throw LocalRAGError.cannotReadDocument(url.lastPathComponent)
-            }
-            return (0..<document.pageCount).compactMap { index in
-                guard let text = document.page(at: index)?.string else { return nil }
-                return (text: text, pageNumber: index + 1)
-            }
-        case "txt", "md", "markdown":
-            return [(text: try String(contentsOf: url, encoding: .utf8), pageNumber: nil)]
-        case "rtf":
-            let data = try Data(contentsOf: url)
-            let text = try NSAttributedString(
-                data: data,
-                options: [.documentType: NSAttributedString.DocumentType.rtf],
-                documentAttributes: nil
-            ).string
-            return [(text: text, pageNumber: nil)]
-        default:
-            throw LocalRAGError.unsupportedDocument(url.lastPathComponent)
-        }
-    }
-
     private func persistIndex() throws {
         let data = try JSONEncoder().encode(chunks)
         try data.write(to: indexURL, options: .atomic)
-    }
-
-    private static func split(_ text: String, maximumLength: Int, overlap: Int) -> [String] {
-        let text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return [] }
-        var result: [String] = []
-        var start = text.startIndex
-        while start < text.endIndex {
-            let end = text.index(start, offsetBy: maximumLength, limitedBy: text.endIndex) ?? text.endIndex
-            let piece = String(text[start..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
-            if !piece.isEmpty {
-                result.append(piece)
-            }
-            guard end < text.endIndex else { break }
-            start = text.index(end, offsetBy: -overlap, limitedBy: text.startIndex) ?? text.startIndex
-            if start == text.startIndex {
-                start = end
-            }
-        }
-        return result
     }
 
     private static func cosineSimilarity(_ lhs: [Float], _ rhs: [Float]) -> Float {
@@ -536,8 +492,6 @@ final class LocalRAGModel {
 
 private enum LocalRAGError: LocalizedError {
     case emptyDocument(String)
-    case cannotReadDocument(String)
-    case unsupportedDocument(String)
     case embedderUnavailable
     case tokenizationFailed
     case noRelevantChunks
@@ -546,10 +500,6 @@ private enum LocalRAGError: LocalizedError {
         switch self {
         case .emptyDocument(let name):
             "\(name) dosyasından metin çıkarılamadı."
-        case .cannotReadDocument(let name):
-            "\(name) PDF dosyası açılamadı."
-        case .unsupportedDocument(let name):
-            "\(name) desteklenmiyor. PDF, TXT, Markdown veya RTF seçin."
         case .embedderUnavailable:
             "Embedding modeli kullanılamıyor. Lütfen yeniden indeksleyin."
         case .tokenizationFailed:

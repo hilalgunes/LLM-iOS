@@ -48,7 +48,8 @@ Stash kayıtları yalnızca ilgili yerel depodadır; normal push ile gönderilme
 
 ## 4. Belgeleri eşitle
 
-- [ ] Parser, chunking, embedding, vektör deposu ve cevap üretimini ayır.
+- [x] Belge okuyucu ve metin parçalama bileşenlerini ayır.
+- [ ] Embedding, vektör deposu ve cevap üretimi sınırlarını düzenle.
 - [ ] Android RAG üretimini ortak runtime üzerinden çalıştır.
 - [ ] iOS ağır dosya/indeks işlerini ana aktörden ayır.
 - [ ] Kaynak gösterimi ve belge/indeks yaşam döngüsünü eşitle.
@@ -105,3 +106,15 @@ Pixel 10 Pro'nun 16 KB sayfa boyutlu emülatöründe uygulama açılışında na
 Doğrulama: Android debug derlemesi ve 43 birim testi başarılı. Emülatörde sohbet geçmişi ve yeni model yönetimi penceresini kapsayan 1 ekran testi başarılı. Gerçek model indirme ve fiziksel cihazdaki iptal gecikmesi henüz denenmedi.
 
 iOS: simülatörde 12 test, 0 hata. Eksik blob, tek dosyalı snapshot, eksik/boş shard, model yönetimi sırasında sohbet engeli ve kaynak bırakma delegasyonu doğrulandı. İlk kurulumdaki boş disk alanı düzeltmesinden sonra ayrıca derleme yapıldı. Canlı ağ kesintisi/yeniden başlatma ve gerçek MLX ağırlıklarıyla indirme/silme henüz cihazda denenmedi.
+
+## Adım 4.1 — belge okuyucu ve metin parçalama (10 Kasım 2026)
+
+- Android PDF/TXT okuma kodu RagDocumentReader'a, saf metin parçalama ve belge-parça eşleme kodu RagTextChunker dosyasına taşındı. RAG ekranı okuyucuyu doğrudan çağırır; dosya okuma IO dispatcher üzerinde devam eder.
+- iOS PDF/TXT/Markdown/RTF okuma kodu RAGDocumentReading arayüzü ve RAGDocumentReader uygulamasına ayrıldı. LocalRAGModel okuyucuyu dışarıdan alabilir; kaynak kopyalama, dosya erişim izni ve indeks kaydı mevcut import akışında kaldı.
+- iOS parçalama RAGTextChunker'a taşındı. PDF sayfa numarası korunur. İki platformda sıfır/negatif parça boyutu ve geçersiz örtüşme açık hatayla reddedilir.
+- Mevcut embedding bütçeleri korunur: Android modele göre farklı boyutlar kullanır; iOS 850 karakter / 120 örtüşme kullanır. Android UTF-16 birimleriyle, Swift birleşik karakterlerle böler; bu adım platformlar arasında birebir aynı parça çıktısı veya yeni indeks formatı getirmez.
+- Android ortak RAG runtime geçişi, iOS ağır import işlerini arka plana taşıma ve belge/indeks yaşam döngüsü sonraki ayrı commit'lerdir.
+
+Doğrulama: Android debug derlemesi ve 50 birim testi başarılı. Yeni PDF okuma testi bağlı SM-N975F cihazında, Samsung Galaxy S26 Ultra ve Pixel 10 Pro emülatörlerinde geçti (her hedefte 1 test). Test kendi iki sayfalık PDF dosyasını oluşturur; metin sırasını ve bozuk PDF hata davranışını kontrol eder. Gerçek LLM/embedding ağırlıkları indirilmedi.
+
+iOS: derleme başarılı; iPhone 18 Pro / iOS 27 simülatöründe 20 test, 0 hata. Yeni 8 test PDF sayfa bilgisi, UTF-8 Markdown, RTF, bozuk/desteklenmeyen dosya, boş metin, örtüşme, geçersiz ayarlar ve birleşik Unicode karakterlerini kapsar. İlk PDF test örneğinin metin eşleşmesi sabit aralıklı font ve ayırt edici sayfa metinleriyle düzeltildi. Simülatör test başlatma sorunu sonrasında son çalışma `test-without-building` ile tamamlandı.
