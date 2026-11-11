@@ -59,12 +59,6 @@ enum RAGEmbeddingChoice: String, CaseIterable, Identifiable {
     }
 }
 
-struct RAGScoredChunk: Identifiable {
-    var id: UUID { chunk.id }
-    let chunk: RAGChunk
-    let score: Float
-}
-
 struct RAGEmbeddingComparison: Identifiable {
     var id: RAGEmbeddingChoice { choice }
     let choice: RAGEmbeddingChoice
@@ -91,6 +85,7 @@ final class LocalRAGModel {
     private var embedder: EmbedderModelContainer?
     private var loadedEmbeddingID: String?
     private let documentStore: RAGDocumentStore
+    private let vectorIndex = RAGVectorIndex()
     private var loadTask: Task<Void, Never>?
     private let embeddingPreferenceKey = "rag.embeddingModel"
 
@@ -242,14 +237,7 @@ final class LocalRAGModel {
             MLXRuntimeSupport.clearCache()
             try await loadEmbedderIfNeeded()
             let queryVector = try await makeEmbedding(for: question, isQuery: true)
-            let matches = chunks
-                .compactMap { chunk -> (RAGChunk, Float)? in
-                    guard let embedding = chunk.embedding else { return nil }
-                    return (chunk, Self.cosineSimilarity(queryVector, embedding))
-                }
-                .sorted { $0.1 > $1.1 }
-                .prefix(4)
-                .map(\.0)
+            let matches = try await vectorIndex.rank(query: queryVector, chunks: chunks).map(\.chunk)
 
             guard !matches.isEmpty else {
                 throw LocalRAGError.noRelevantChunks
@@ -337,7 +325,7 @@ final class LocalRAGModel {
                         isQuery: false,
                         using: choice
                     )
-                    let score = Self.cosineSimilarity(queryVector, vector)
+                    guard let score = RAGVectorIndex.cosineSimilarity(queryVector, vector) else { continue }
                     progress = (Double(index) + Double(offset + 1) / Double(chunks.count)) / 2
                     scoredChunks.append(RAGScoredChunk(chunk: chunk, score: score))
                 }
@@ -445,14 +433,7 @@ final class LocalRAGModel {
         try await documentStore.save(chunks)
     }
 
-    private static func cosineSimilarity(_ lhs: [Float], _ rhs: [Float]) -> Float {
-        guard lhs.count == rhs.count, !lhs.isEmpty else { return -1 }
-        let dot = zip(lhs, rhs).reduce(Float.zero) { $0 + $1.0 * $1.1 }
-        let lhsNorm = sqrt(lhs.reduce(Float.zero) { $0 + $1 * $1 })
-        let rhsNorm = sqrt(rhs.reduce(Float.zero) { $0 + $1 * $1 })
-        guard lhsNorm > 0, rhsNorm > 0 else { return -1 }
-        return dot / (lhsNorm * rhsNorm)
-    }
+
 }
 
 private enum LocalRAGError: LocalizedError {

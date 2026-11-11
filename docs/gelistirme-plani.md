@@ -139,3 +139,15 @@ iOS: derleme başarılı; iPhone 18 Pro / iOS 27 simülatöründe 20 test, 0 hat
 - Aynı isimle eklenen farklı kaynaklar ayrı kimliklerle listelenir ve silinir. Eski, kaynak kopyası olmayan indekslerin adla gruplama davranışı korunur.
 - Silme sonrası yalnızca ilgili kaynağın parçaları ve kopyası kaldırılır; açık kaynak seçimi temizlenir.
 - Doğrulama: iOS simülatöründe 29 test başarılı. Aynı isimli iki dosyanın bağımsız silinmesi ve uygulama yeniden açıldığında kalan kaynağın korunması test edildi.
+
+## Adım 4.5 — Android kalıcı vektör yaşam döngüsü (12 Kasım 2026)
+
+- SQLite snapshot artık kayıtlı embedding vektörlerini de geri yükler. Yeniden açılış sonrasında bellek içi arama ve mevcut belgelerin üzerine ekleme/silme vektörlerini kaybetmez.
+- İndeks yazımı IO dispatcher üzerinde yapılır. Eksik vektör veya native kayıt hatasında bellek durumu son kaydedilmiş snapshot’a döner.
+- Doğrulama: 53 JVM testi ve debug derlemesi başarılı. Pixel 10 Pro / Android 17 emülatöründe yeni kalıcı indeks testi geçti; yeniden açılış, aynı isimli iki belge, başarısız indeks güncellemesi, silme ve kalan belgeyle arama doğrulandı.
+
+## Adım 4.6 — iOS vektör arama servisi (12 Kasım 2026)
+
+- Vektör sıralaması RAGVectorIndex actor içine taşındı. UI modeli arama sonucu bekler; dosya servisi ve vektör araması ayrı sorumluluklara sahiptir.
+- Arama yalnızca istenen en iyi k sonucu tutar. Boyutu uyuşmayan, sıfır normlu ve sonlu olmayan vektörler atlanır; eşit puanlarda kaynak sırası korunur.
+- Doğrulama: simülatörde 31 test başarılı; sıralama, geçersiz vektörler, boş sonuç ve iptal testleri eklendi. Fiziksel cihazda veri hacmi/perf ölçümü ve alternatif depo seçimi açık kalır.
