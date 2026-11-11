@@ -1,11 +1,5 @@
 import Foundation
-import HuggingFace
-import MLX
-import MLXEmbedders
-import MLXHuggingFace
-import MLXLMCommon
 import Observation
-import Tokenizers
 
 enum RAGEmbeddingChoice: String, CaseIterable, Identifiable {
     case multilingualE5
@@ -82,8 +76,7 @@ final class LocalRAGModel {
     var selectedSource: RAGChunk?
     var embeddingComparison: [RAGEmbeddingComparison] = []
 
-    private var embedder: EmbedderModelContainer?
-    private var loadedEmbeddingID: String?
+    private let embeddingService: any RAGEmbeddingServing
     private let documentStore: RAGDocumentStore
     private let vectorIndex = RAGVectorIndex()
     private var loadTask: Task<Void, Never>?
@@ -103,9 +96,10 @@ final class LocalRAGModel {
         chunks.contains { $0.embedding == nil }
     }
 
-    init(documentReader: any RAGDocumentReading = RAGDocumentReader(), directory: URL? = nil) {
+    init(documentReader: any RAGDocumentReading = RAGDocumentReader(), directory: URL? = nil, embeddingService: (any RAGEmbeddingServing)? = nil) {
         let directory = directory ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         documentStore = RAGDocumentStore(directory: directory, reader: documentReader)
+        self.embeddingService = embeddingService ?? RAGEmbeddingService()
         if let storedChoice = UserDefaults.standard.string(forKey: embeddingPreferenceKey),
            let choice = RAGEmbeddingChoice(rawValue: storedChoice) {
             selectedEmbedding = choice
@@ -140,12 +134,7 @@ final class LocalRAGModel {
         }
     }
 
-    func unloadEmbedder() {
-        let hadModel = embedder != nil
-        embedder = nil
-        loadedEmbeddingID = nil
-        if hadModel { MLXRuntimeSupport.clearCache() }
-    }
+    func unloadEmbedder() { embeddingService.unload() }
 
     func importDocuments(from urls: [URL]) async {
         guard !isBusy else { return }
@@ -368,7 +357,7 @@ final class LocalRAGModel {
     }
 
     private func requireEmbeddingRuntime() -> Bool {
-        guard MLXRuntimeSupport.isSupported else {
+        guard embeddingService.isSupported else {
             errorMessage = LocalChatError.simulatorNotSupported.localizedDescription
             return false
         }
@@ -376,57 +365,15 @@ final class LocalRAGModel {
     }
 
     private func loadEmbedderIfNeeded(for choice: RAGEmbeddingChoice? = nil) async throws {
-        try MLXRuntimeSupport.requireSupported()
         let choice = choice ?? selectedEmbedding
-        guard loadedEmbeddingID != choice.id else { return }
-        unloadEmbedder()
         statusMessage = "\(choice.title) indiriliyor ve yükleniyor…"
-        let loaded = try await EmbedderModelFactory.shared.loadContainer(
-            from: #hubDownloader(),
-            using: #huggingFaceTokenizerLoader(),
-            configuration: ModelConfiguration(id: choice.repositoryID),
-            progressHandler: { [weak self] progress in
-                let fractionCompleted = progress.fractionCompleted
-                guard let self else { return }
-                Task { @MainActor in
-                    self.progress = min(max(fractionCompleted, 0), 1)
-                }
-            }
-        )
-        embedder = loaded
-        loadedEmbeddingID = choice.id
+        try await embeddingService.prepare(choice: choice) { [weak self] value in
+            self?.progress = value
+        }
     }
 
-    private func makeEmbedding(
-        for text: String,
-        isQuery: Bool,
-        using choice: RAGEmbeddingChoice? = nil
-    ) async throws -> [Float] {
-        guard let embedder else {
-            throw LocalRAGError.embedderUnavailable
-        }
-        let choice = choice ?? selectedEmbedding
-        let prefix = isQuery ? choice.queryPrefix : choice.passagePrefix
-        return try await embedder.perform { context in
-            let tokenIDs = context.tokenizer.encode(
-                text: prefix + text,
-                addSpecialTokens: true
-            )
-            guard !tokenIDs.isEmpty else {
-                throw LocalRAGError.tokenizationFailed
-            }
-
-            let inputs = stacked([MLXArray(tokenIDs)])
-            let output = context.model(
-                inputs,
-                positionIds: nil,
-                tokenTypeIds: nil,
-                attentionMask: nil
-            )
-            let vector = context.pooling(output, normalize: true)
-            vector.eval()
-            return vector[0].asArray(Float.self)
-        }
+    private func makeEmbedding(for text: String, isQuery: Bool, using choice: RAGEmbeddingChoice? = nil) async throws -> [Float] {
+        try await embeddingService.embed(text: text, isQuery: isQuery, choice: choice ?? selectedEmbedding)
     }
 
     private func persistIndex() async throws {

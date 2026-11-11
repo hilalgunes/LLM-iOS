@@ -49,7 +49,7 @@ Stash kayıtları yalnızca ilgili yerel depodadır; normal push ile gönderilme
 ## 4. Belgeleri eşitle
 
 - [x] Belge okuyucu ve metin parçalama bileşenlerini ayır.
-- [ ] Embedding, vektör deposu ve cevap üretimi sınırlarını düzenle.
+- [x] Embedding, vektör deposu ve cevap üretimi sınırlarını düzenle.
 - [x] Android RAG üretimini ortak runtime üzerinden çalıştır.
 - [x] iOS ağır dosya/indeks işlerini ana aktörden ayır.
 - [ ] Kaynak gösterimi ve belge/indeks yaşam döngüsünü eşitle.
@@ -151,3 +151,9 @@ iOS: derleme başarılı; iPhone 18 Pro / iOS 27 simülatöründe 20 test, 0 hat
 - Vektör sıralaması RAGVectorIndex actor içine taşındı. UI modeli arama sonucu bekler; dosya servisi ve vektör araması ayrı sorumluluklara sahiptir.
 - Arama yalnızca istenen en iyi k sonucu tutar. Boyutu uyuşmayan, sıfır normlu ve sonlu olmayan vektörler atlanır; eşit puanlarda kaynak sırası korunur.
 - Doğrulama: simülatörde 31 test başarılı; sıralama, geçersiz vektörler, boş sonuç ve iptal testleri eklendi. Fiziksel cihazda veri hacmi/perf ölçümü ve alternatif depo seçimi açık kalır.
+
+## Adım 4.7 — embedding servis sahipliği (12 Kasım 2026)
+
+- Android embedding sağlayıcısı RagEmbeddingSessionService tarafından yönetilir. Model kimliği ve dosyaları aynıysa yeniden kullanılır; model/dosya değişimi, hata ve iptalde eski sağlayıcı kapanır. Kapatma aktif embedding işlemini bekler.
+- iOS MLX embedding yükleme ve vektör üretimi RAGEmbeddingServing arayüzüne taşındı. LocalRAGModel belge ve ekran akışını yönetir; model yükleyicisi içermez. Yükleme sürerken bırakılan model geç tamamlanıp yeniden etkinleşmez.
+- Android 56 birim testi ve debug derlemesi geçti. iOS simülatöründe 33 test geçti; sahte servisle indeks kaydı ve hazırlık hatasından sonra yeniden deneme doğrulandı. Gerçek embedding ağırlıklarıyla cihaz çalışması bu testlerin kapsamı dışındadır.
