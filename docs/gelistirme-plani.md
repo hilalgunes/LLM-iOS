@@ -133,3 +133,9 @@ iOS: derleme başarılı; iPhone 18 Pro / iOS 27 simülatöründe 20 test, 0 hat
 - Embedding seçimi ve belge silme indeks kaydı başarılı olduktan sonra ekrana yansır. Silinen belgelere ait cevap/kaynak ve karşılaştırma state’i temizlenir.
 - Eski indeks formatı korunur. Kaynak dosyasının silinmesi başarısız olursa kaydedilmiş indeks korunur; artık dosyaların temizlenmesi ayrıca ele alınabilir.
 - Doğrulama: iOS simülatör derlemesi ve 28 test başarılı. Arka planda okuma, toplu import geri alma, disk yazma hatasında state koruma ve eski indeks yükleme/silme testleri eklendi.
+
+## Adım 4.4 — iOS belge kimliği (12 Kasım 2026)
+
+- Aynı isimle eklenen farklı kaynaklar ayrı kimliklerle listelenir ve silinir. Eski, kaynak kopyası olmayan indekslerin adla gruplama davranışı korunur.
+- Silme sonrası yalnızca ilgili kaynağın parçaları ve kopyası kaldırılır; açık kaynak seçimi temizlenir.
+- Doğrulama: iOS simülatöründe 29 test başarılı. Aynı isimli iki dosyanın bağımsız silinmesi ve uygulama yeniden açıldığında kalan kaynağın korunması test edildi.

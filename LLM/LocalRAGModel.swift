@@ -94,8 +94,10 @@ final class LocalRAGModel {
     private var loadTask: Task<Void, Never>?
     private let embeddingPreferenceKey = "rag.embeddingModel"
 
-    var documentNames: [String] {
-        Array(Set(chunks.map(\.sourceName))).sorted()
+    var documents: [RAGDocumentSummary] {
+        Dictionary(grouping: chunks, by: \.documentID).map { id, pieces in
+            RAGDocumentSummary(id: id, name: pieces[0].sourceName, chunkCount: pieces.count)
+        }.sorted { ($0.name, $0.id) < ($1.name, $1.id) }
     }
 
     var indexedChunkCount: Int {
@@ -354,14 +356,14 @@ final class LocalRAGModel {
         }
     }
 
-    func removeDocument(named name: String) async {
+    func removeDocument(id: String) async {
         guard !isBusy else { return }
         isProcessing = true
         defer { isProcessing = false }
         do {
-            chunks = try await documentStore.removing(named: name, from: chunks)
-            sources.removeAll { $0.sourceName == name }
-            if selectedSource?.sourceName == name { selectedSource = nil }
+            chunks = try await documentStore.removing(documentID: id, from: chunks)
+            sources.removeAll { $0.documentID == id }
+            if selectedSource?.documentID == id { selectedSource = nil }
             embeddingComparison = []
             answer = ""
         } catch {

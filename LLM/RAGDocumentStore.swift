@@ -7,6 +7,15 @@ nonisolated struct RAGChunk: Codable, Identifiable, Sendable {
     var embedding: [Float]?
     var sourceStorageName: String?
     var pageNumber: Int?
+
+    // Legacy indexes have no stored original; preserve their name-based grouping.
+    var documentID: String { sourceStorageName.map { "file:" + $0 } ?? "legacy:" + sourceName }
+}
+
+nonisolated struct RAGDocumentSummary: Identifiable, Sendable {
+    let id: String
+    let name: String
+    let chunkCount: Int
 }
 
 /// Serializes document and index IO away from the UI actor.
@@ -72,11 +81,11 @@ actor RAGDocumentStore {
     }
 
     /// Commit the index before removing originals so a failed write leaves usable documents.
-    func removing(named name: String, from chunks: [RAGChunk]) throws -> [RAGChunk] {
-        let remaining = chunks.filter { $0.sourceName != name }
+    func removing(documentID: String, from chunks: [RAGChunk]) throws -> [RAGChunk] {
+        let remaining = chunks.filter { $0.documentID != documentID }
         try save(remaining)
         let retained = Set(remaining.compactMap(\.sourceStorageName))
-        let removed = Set(chunks.filter { $0.sourceName == name }.compactMap(\.sourceStorageName))
+        let removed = Set(chunks.filter { $0.documentID == documentID }.compactMap(\.sourceStorageName))
         for storedName in removed.subtracting(retained) where URL(fileURLWithPath: storedName).lastPathComponent == storedName {
             // A leftover original is harmless; a committed index must still reach the UI.
             try? FileManager.default.removeItem(at: sourceDirectory.appendingPathComponent(storedName))

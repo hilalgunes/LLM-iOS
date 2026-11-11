@@ -196,28 +196,28 @@ struct RAGView: View {
                 .disabled(rag.isBusy)
             }
 
-            if rag.documentNames.isEmpty {
+            if rag.documents.isEmpty {
                 Text("PDF, TXT, Markdown veya RTF dosyası ekleyin.")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 4)
             } else {
-                ForEach(rag.documentNames, id: \.self) { name in
+                ForEach(rag.documents) { document in
                     HStack(spacing: 10) {
                         Image(systemName: "doc.text.fill")
                             .foregroundStyle(.teal)
-                        Text(name)
+                        Text(document.name)
                             .font(.subheadline)
                             .lineLimit(1)
                         Spacer()
                         Button(role: .destructive) {
-                            Task { await rag.removeDocument(named: name) }
+                            Task { await rag.removeDocument(id: document.id) }
                         } label: {
                             Image(systemName: "trash")
                                 .font(.subheadline)
                         }
                         .disabled(rag.isBusy)
-                        .accessibilityLabel("\(name) belgesini sil")
+                        .accessibilityLabel("\(document.name) belgesini sil")
                     }
                     .padding(.vertical, 3)
                 }

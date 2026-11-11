@@ -54,6 +54,33 @@ final class RAGDocumentStoreTests: XCTestCase {
         XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: model.sourceDirectory.path).isEmpty)
     }
 
+    func testSameNamedDocumentsHaveIndependentLifetimes() async throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("note.txt")
+        try "Birinci".write(to: source, atomically: true, encoding: .utf8)
+        let model = LocalRAGModel(directory: root)
+        await model.waitUntilLoaded()
+        await model.importDocuments(from: [source])
+        try "İkinci".write(to: source, atomically: true, encoding: .utf8)
+        await model.importDocuments(from: [source])
+        XCTAssertEqual(model.documents.count, 2)
+        let first = try XCTUnwrap(model.chunks.first)
+        let second = try XCTUnwrap(model.chunks.last)
+        XCTAssertNotEqual(first.documentID, second.documentID)
+        model.sources = [first, second]
+        model.selectedSource = first
+        await model.removeDocument(id: first.documentID)
+        XCTAssertEqual(model.chunks.map(\.id), [second.id])
+        XCTAssertEqual(model.sources.map(\.id), [second.id])
+        XCTAssertNil(model.selectedSource)
+        XCTAssertNil(model.sourceURL(for: first))
+        XCTAssertNotNil(model.sourceURL(for: second))
+        let reloaded = LocalRAGModel(directory: root)
+        await reloaded.waitUntilLoaded()
+        XCTAssertEqual(reloaded.documents.map(\.id), [second.documentID])
+    }
+
     func testLegacyIndexLoadsAndRemovalPersists() async throws {
         let root = try directory()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -63,7 +90,7 @@ final class RAGDocumentStoreTests: XCTestCase {
         XCTAssertTrue(model.isBusy)
         await model.waitUntilLoaded()
         XCTAssertEqual(model.chunks.count, 1)
-        await model.removeDocument(named: "legacy.txt")
+        await model.removeDocument(id: "legacy:legacy.txt")
         XCTAssertTrue(model.chunks.isEmpty)
         let reloaded = LocalRAGModel(directory: root)
         await reloaded.waitUntilLoaded()
