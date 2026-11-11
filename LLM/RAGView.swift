@@ -157,7 +157,7 @@ struct RAGView: View {
                 Menu {
                     ForEach(RAGEmbeddingChoice.allCases) { choice in
                         Button {
-                            rag.selectEmbedding(choice)
+                            Task { await rag.selectEmbedding(choice) }
                         } label: {
                             if rag.selectedEmbedding == choice {
                                 Label(choice.title, systemImage: "checkmark")
@@ -211,7 +211,7 @@ struct RAGView: View {
                             .lineLimit(1)
                         Spacer()
                         Button(role: .destructive) {
-                            rag.removeDocument(named: name)
+                            Task { await rag.removeDocument(named: name) }
                         } label: {
                             Image(systemName: "trash")
                                 .font(.subheadline)

@@ -1,7 +1,7 @@
 import Foundation
 
 /// Pure text splitting. Budgets count Swift Characters, preserving composed characters.
-enum RAGTextChunker {
+nonisolated enum RAGTextChunker {
     static func split(_ text: String, maximumLength: Int = 850, overlap: Int = 120) throws -> [String] {
         guard maximumLength > 0, overlap >= 0, overlap < maximumLength else {
             throw ChunkingError.invalidConfiguration

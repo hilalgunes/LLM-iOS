@@ -59,15 +59,6 @@ enum RAGEmbeddingChoice: String, CaseIterable, Identifiable {
     }
 }
 
-struct RAGChunk: Codable, Identifiable {
-    var id: UUID
-    var sourceName: String
-    var text: String
-    var embedding: [Float]?
-    var sourceStorageName: String?
-    var pageNumber: Int?
-}
-
 struct RAGScoredChunk: Identifiable {
     var id: UUID { chunk.id }
     let chunk: RAGChunk
@@ -87,7 +78,8 @@ final class LocalRAGModel {
     var chunks: [RAGChunk] = []
     private var isProcessing = false
     var isManagingModels = false
-    var isBusy: Bool { isProcessing || isManagingModels }
+    private(set) var isLoadingIndex = true
+    var isBusy: Bool { isProcessing || isManagingModels || isLoadingIndex }
     var progress = 0.0
     var statusMessage: String?
     var errorMessage: String?
@@ -98,8 +90,8 @@ final class LocalRAGModel {
 
     private var embedder: EmbedderModelContainer?
     private var loadedEmbeddingID: String?
-    private let documentReader: any RAGDocumentReading
-    private let indexURL: URL
+    private let documentStore: RAGDocumentStore
+    private var loadTask: Task<Void, Never>?
     private let embeddingPreferenceKey = "rag.embeddingModel"
 
     var documentNames: [String] {
@@ -114,34 +106,38 @@ final class LocalRAGModel {
         chunks.contains { $0.embedding == nil }
     }
 
-    init(documentReader: any RAGDocumentReading = RAGDocumentReader()) {
-        self.documentReader = documentReader
+    init(documentReader: any RAGDocumentReading = RAGDocumentReader(), directory: URL? = nil) {
+        let directory = directory ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        documentStore = RAGDocumentStore(directory: directory, reader: documentReader)
         if let storedChoice = UserDefaults.standard.string(forKey: embeddingPreferenceKey),
            let choice = RAGEmbeddingChoice(rawValue: storedChoice) {
             selectedEmbedding = choice
         }
-        let documentsURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        indexURL = documentsURL.appendingPathComponent("rag-index.json")
-        do {
-            let data = try Data(contentsOf: indexURL)
-            chunks = try JSONDecoder().decode([RAGChunk].self, from: data)
-        } catch {
-            if (error as NSError).code != NSFileReadNoSuchFileError {
-                errorMessage = "Kaydedilmiş belge indeksi açılamadı: \(error.localizedDescription)"
+        loadTask = Task { [weak self, documentStore] in
+            do {
+                let saved = try await documentStore.load()
+                self?.chunks = saved
+            } catch {
+                self?.errorMessage = "Kaydedilmiş belge indeksi açılamadı: \(error.localizedDescription)"
             }
+            self?.isLoadingIndex = false
         }
     }
 
-    func selectEmbedding(_ choice: RAGEmbeddingChoice) {
+    func waitUntilLoaded() async { await loadTask?.value }
+
+    func selectEmbedding(_ choice: RAGEmbeddingChoice) async {
         guard choice != selectedEmbedding, !isBusy else { return }
-        selectedEmbedding = choice
-        UserDefaults.standard.set(choice.rawValue, forKey: embeddingPreferenceKey)
-        unloadEmbedder()
-        for index in chunks.indices {
-            chunks[index].embedding = nil
-        }
+        isProcessing = true
+        defer { isProcessing = false }
+        var updated = chunks
+        for index in updated.indices { updated[index].embedding = nil }
         do {
-            try persistIndex()
+            try await documentStore.save(updated)
+            chunks = updated
+            selectedEmbedding = choice
+            UserDefaults.standard.set(choice.rawValue, forKey: embeddingPreferenceKey)
+            unloadEmbedder()
         } catch {
             errorMessage = "İndeks kaydedilemedi: \(error.localizedDescription)"
         }
@@ -168,45 +164,7 @@ final class LocalRAGModel {
         }
 
         do {
-            var newChunks: [RAGChunk] = []
-            let sourceDirectory = documentsDirectory.appendingPathComponent("rag-source-files", isDirectory: true)
-            try FileManager.default.createDirectory(
-                at: sourceDirectory,
-                withIntermediateDirectories: true
-            )
-            for url in urls {
-                let hasAccess = url.startAccessingSecurityScopedResource()
-                defer {
-                    if hasAccess {
-                        url.stopAccessingSecurityScopedResource()
-                    }
-                }
-                let storedName = "\(UUID().uuidString).\(url.pathExtension)"
-                let storedURL = sourceDirectory.appendingPathComponent(storedName)
-                let pages = try documentReader.read(from: url)
-                let pieces = try pages.flatMap { page in
-                    try RAGTextChunker.split(page.text, maximumLength: 850, overlap: 120).map {
-                        (text: $0, pageNumber: page.pageNumber)
-                    }
-                }
-                guard !pieces.isEmpty else {
-                    throw LocalRAGError.emptyDocument(url.lastPathComponent)
-                }
-                try FileManager.default.copyItem(at: url, to: storedURL)
-                newChunks.append(contentsOf: pieces.map {
-                    RAGChunk(
-                        id: UUID(),
-                        sourceName: url.lastPathComponent,
-                        text: $0.text,
-                        embedding: nil,
-                        sourceStorageName: storedName,
-                        pageNumber: $0.pageNumber
-                    )
-                })
-            }
-            guard !newChunks.isEmpty else { return }
-            chunks.append(contentsOf: newChunks)
-            try persistIndex()
+            chunks = try await documentStore.importing(urls, into: chunks)
             statusMessage = "\(urls.count) belge eklendi. Sorular için önce indeks oluştur."
         } catch {
             errorMessage = error.localizedDescription
@@ -238,16 +196,16 @@ final class LocalRAGModel {
                 chunks[index].embedding = vector
                 progress = Double(completed + 1) / Double(pendingIndices.count)
                 if completed.isMultiple(of: 8) {
-                    try persistIndex()
+                    try await persistIndex()
                     MLXRuntimeSupport.clearCache()
                 }
             }
-            try persistIndex()
+            try await persistIndex()
             statusMessage = "\(chunks.count) metin parçası indekslendi."
         } catch {
             errorMessage = error.localizedDescription
             do {
-                try persistIndex()
+                try await persistIndex()
             } catch {
                 errorMessage = "\(errorMessage ?? "İndeks oluşturulamadı.") İndeks diske kaydedilemedi: \(error.localizedDescription)"
             }
@@ -396,30 +354,22 @@ final class LocalRAGModel {
         }
     }
 
-    func removeDocument(named name: String) {
+    func removeDocument(named name: String) async {
         guard !isBusy else { return }
-        let sourceNames = Set(chunks.filter { $0.sourceName == name }.compactMap(\.sourceStorageName))
-        chunks.removeAll { $0.sourceName == name }
+        isProcessing = true
+        defer { isProcessing = false }
         do {
-            try persistIndex()
-            for sourceName in sourceNames {
-                let url = sourceDirectory.appendingPathComponent(sourceName)
-                if FileManager.default.fileExists(atPath: url.path) {
-                    try FileManager.default.removeItem(at: url)
-                }
-            }
+            chunks = try await documentStore.removing(named: name, from: chunks)
+            sources.removeAll { $0.sourceName == name }
+            if selectedSource?.sourceName == name { selectedSource = nil }
+            embeddingComparison = []
+            answer = ""
         } catch {
             errorMessage = "Belge indeksi kaydedilemedi: \(error.localizedDescription)"
         }
     }
 
-    var sourceDirectory: URL {
-        documentsDirectory.appendingPathComponent("rag-source-files", isDirectory: true)
-    }
-
-    private var documentsDirectory: URL {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-    }
+    var sourceDirectory: URL { documentStore.sourceDirectory }
 
     func sourceURL(for chunk: RAGChunk) -> URL? {
         guard let storedName = chunk.sourceStorageName else { return nil }
@@ -489,9 +439,8 @@ final class LocalRAGModel {
         }
     }
 
-    private func persistIndex() throws {
-        let data = try JSONEncoder().encode(chunks)
-        try data.write(to: indexURL, options: .atomic)
+    private func persistIndex() async throws {
+        try await documentStore.save(chunks)
     }
 
     private static func cosineSimilarity(_ lhs: [Float], _ rhs: [Float]) -> Float {

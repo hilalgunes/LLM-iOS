@@ -2,17 +2,17 @@ import Foundation
 import PDFKit
 import UIKit
 
-struct RAGDocumentPage {
+nonisolated struct RAGDocumentPage: Sendable {
     let text: String
     let pageNumber: Int?
 }
 
-protocol RAGDocumentReading {
+nonisolated protocol RAGDocumentReading: Sendable {
     func read(from url: URL) throws -> [RAGDocumentPage]
 }
 
 /// Reads content only. Security-scoped access and source copies belong to the importer.
-struct RAGDocumentReader: RAGDocumentReading {
+nonisolated struct RAGDocumentReader: RAGDocumentReading {
     func read(from url: URL) throws -> [RAGDocumentPage] {
         switch url.pathExtension.lowercased() {
         case "pdf":
@@ -40,7 +40,7 @@ struct RAGDocumentReader: RAGDocumentReading {
 
 }
 
-enum RAGDocumentReadError: LocalizedError {
+nonisolated enum RAGDocumentReadError: LocalizedError {
     case cannotReadDocument(String)
     case unsupportedDocument(String)
     var errorDescription: String? {

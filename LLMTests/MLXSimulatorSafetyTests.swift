@@ -4,8 +4,9 @@ import XCTest
 #if targetEnvironment(simulator)
 @MainActor
 final class MLXSimulatorSafetyTests: XCTestCase {
-    func testUnloadedEmbedderCanBeReleasedRepeatedlyWithoutInitializingMetal() {
+    func testUnloadedEmbedderCanBeReleasedRepeatedlyWithoutInitializingMetal() async {
         let rag = LocalRAGModel()
+        await rag.waitUntilLoaded()
         for _ in 0..<20 { rag.unloadEmbedder() }
         MLXRuntimeSupport.clearCache()
         XCTAssertFalse(rag.isBusy)
@@ -37,6 +38,7 @@ final class MLXSimulatorSafetyTests: XCTestCase {
 
     func testRAGRequestsReportUnsupportedRuntimeWithoutChangingIndex() async throws {
         let rag = LocalRAGModel()
+        await rag.waitUntilLoaded()
         let originalIDs = rag.chunks.map(\.id)
         let chat = LocalChatModel()
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
