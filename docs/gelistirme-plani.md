@@ -57,10 +57,10 @@ Stash kayıtları yalnızca ilgili yerel depodadır; normal push ile gönderilme
 
 ## 5. Laboratuvarı düzenle
 
-- [ ] Benchmark, embedding karşılaştırması ve yeni deneyleri tek alanda topla.
+- [x] Benchmark, embedding karşılaştırması ve yeni deneyleri tek alanda topla.
 - [ ] Ortak deney/sonuç şeması: model sürümü, prompt, parametreler, chunking, top-k ve süre tanımları.
-- [ ] Soğuk yükleme ile sıcak üretim ölçümlerini ayır.
-- [ ] Kaydedilmiş deneyi tekrar çalıştırmayı sağla.
+- [x] Soğuk yükleme ile sıcak üretim ölçümlerini ayır.
+- [x] Kaydedilmiş deneyi tekrar çalıştırmayı sağla.
 - [ ] Yedekteki OCR/GPU deneylerinden uygun olanları ayrı adımlarla geri getir.
 
 ## Adım 1 doğrulama kaydı — 5 Kasım 2026
@@ -191,3 +191,10 @@ iOS: derleme başarılı; iPhone 18 Pro / iOS 27 simülatöründe 20 test, 0 hat
 - Android benchmark, model karşılaştırması, embedding ve etkileşim testleri Laboratuvar girişinde toplandı. Alt gezinme Sohbet, RAG, Laboratuvar ve Sonuçlar olarak sadeleşti.
 - iOS embedding karşılaştırması RAG ürün ekranından Laboratuvar’a taşındı; Jev deneyleri ve sonuçlara aynı alandan erişilir. Aktif işlem sırasında sekme değişiminin modeli erken bırakması önlendi.
 - Android 63 birim testi, debug derlemesi ve Pixel emülatöründe Laboratuvar → karşılaştırma → embedding → RAG gezinme testi başarılı. iOS simülatör derlemesi ve 37 test başarılı.
+
+## Adım 5.2 — tekrarlanabilir model deneyleri (12 Kasım 2026)
+
+- İki Laboratuvar’a kalıcı model deneyi eklendi. Kayıttan aynı ayarlarla yeniden çalıştırma, iptal ve kısmi yanıt kaydı, JSON paylaşımı bulunur. Bozuk kayıt üzerine yazılmaz.
+- Ortak v1 üretim deney şeması `deney-kayit-sozlesmesi.md` içinde tanımlıdır. Model sürümü bilinmiyorsa boş bırakılır. Chunking/top-k alanları bu üretim deneyinde uygulanmaz; mevcut embedding ve eski benchmark raporlarının bu formata taşınması açık kalır.
+- Soğuk oturum yeniden açılır; ısıtılmış ölçümden önce kayıt dışı bir hazırlık yanıtı üretilir. Android warm yalnızca LiteRT için; iOS deneyleri MLX için açıktır. Hazırlık, üretim ve ilk metin süreleri ayrıdır; hazırlık saf model yüklemesi diye sunulmaz.
+- Android 67 birim testi, debug derlemesi ve Samsung SM-N975F ile Pixel 10 Pro’da ikişer gezinme testi geçti. iOS 40 simülatör testi ve cihaz hedefi derlemesi geçti. Bu kayıttaki testler gerçek model performansı ölçümü değildir.

@@ -9,6 +9,9 @@ struct LaboratoryView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section("Model ölçümleri") {
+                    NavigationLink("Tekrarlanabilir model deneyi") { ModelExperimentView(chat: chat, rag: rag) }
+                }
                 Section("Arama deneyleri") {
                     NavigationLink("Embedding karşılaştırması") {
                         RAGView(chat: chat, rag: rag, history: history, laboratoryMode: true)

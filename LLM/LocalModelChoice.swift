@@ -57,6 +57,8 @@ enum LocalModelChoice: String, CaseIterable, Identifiable {
         }
     }
 
+    var responseTokenLimit: Int { self == .gemma4 ? 256 : 384 }
+
     var configuration: ModelConfiguration {
         switch self {
         case .gemma4:

@@ -153,7 +153,7 @@ final class LocalModelSessionService: ModelSessionServing {
         var response = ""
         let options = AnyLanguageModel.GenerationOptions(
             temperature: 0.6,
-            maximumResponseTokens: selectedModel == .gemma4 ? 256 : 384
+            maximumResponseTokens: selectedModel.responseTokenLimit
         )
         try Task.checkCancellation()
         for try await snapshot in session.streamResponse(to: prompt, options: options) {
