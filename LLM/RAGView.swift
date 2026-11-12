@@ -6,6 +6,7 @@ struct RAGView: View {
     @Bindable var chat: LocalChatModel
     @Bindable var rag: LocalRAGModel
     @Bindable var history: ConversationHistoryStore
+    var laboratoryMode = false
     @State private var isShowingImporter = false
     @State private var isShowingHistory = false
     @State private var question = ""
@@ -34,20 +35,25 @@ struct RAGView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    modelCard
+                    if !laboratoryMode { modelCard }
                     documentsCard
-                    questionCard
-                    comparisonCard
+                    if laboratoryMode {
+                        TextField("Karşılaştırma sorusu", text: $question, axis: .vertical)
+                            .textFieldStyle(.roundedBorder)
+                        comparisonCard
+                    } else {
+                        questionCard
+                    }
 
                     if let status = rag.statusMessage {
                         statusCard(status)
                     }
 
-                    if !rag.embeddingComparison.isEmpty {
+                    if laboratoryMode && !rag.embeddingComparison.isEmpty {
                         comparisonResultsCard
                     }
 
-                    if !rag.answer.isEmpty {
+                    if !laboratoryMode && !rag.answer.isEmpty {
                         answerCard
                     }
                 }
@@ -100,7 +106,7 @@ struct RAGView: View {
                 )
 
             VStack(alignment: .leading, spacing: 3) {
-                Text("Belgelere sor · RAG")
+                Text(laboratoryMode ? "Embedding karşılaştırması" : "Belgelere sor · RAG")
                     .font(.headline)
                 Text("Belgeler cihazında indekslenir")
                     .font(.caption)

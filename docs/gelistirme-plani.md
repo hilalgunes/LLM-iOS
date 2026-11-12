@@ -185,3 +185,9 @@ iOS: derleme başarılı; iPhone 18 Pro / iOS 27 simülatöründe 20 test, 0 hat
 - iOS kaynak kartı ve modele gönderilen bağlam belge adı, parça numarası ve varsa PDF sayfasını taşır. Embedding değişiminde eski cevap/kaynak/karşılaştırma temizlenir. Android kaynakları belge ve parça numarasıyla gösterir; PDF sayfa metadata’sı hâlâ iOS’a özgüdür.
 - iOS yalnızca geçerli indeks okunduktan sonra uygulamanın UUID isimli, referanssız kaynak kopyalarını temizler. Bozuk indekste ve tanınmayan dosyalarda silme yapılmaz.
 - Android 63 birim testi ve debug derlemesi geçti; Pixel 10 Pro’da sahte embedding sağlayıcısıyla model değişimi, yeniden indeksleme, yeniden açılış ve temizleme testi geçti. iOS 37 simülatör testi ve cihaz hedefi derlemesi geçti.
+
+## Adım 5.1 — Laboratuvar girişi (12 Kasım 2026)
+
+- Android benchmark, model karşılaştırması, embedding ve etkileşim testleri Laboratuvar girişinde toplandı. Alt gezinme Sohbet, RAG, Laboratuvar ve Sonuçlar olarak sadeleşti.
+- iOS embedding karşılaştırması RAG ürün ekranından Laboratuvar’a taşındı; Jev deneyleri ve sonuçlara aynı alandan erişilir. Aktif işlem sırasında sekme değişiminin modeli erken bırakması önlendi.
+- Android 63 birim testi, debug derlemesi ve Pixel emülatöründe Laboratuvar → karşılaştırma → embedding → RAG gezinme testi başarılı. iOS simülatör derlemesi ve 37 test başarılı.

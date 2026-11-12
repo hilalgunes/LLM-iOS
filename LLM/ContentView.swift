@@ -28,7 +28,7 @@ struct ContentView: View {
             } else if selectedTab == 1 {
                 RAGView(chat: chat, rag: rag, history: history)
             } else if selectedTab == 2 {
-                JevView(chat: chat, jev: jev, history: history)
+                LaboratoryView(chat: chat, rag: rag, jev: jev, history: history)
             } else {
                 ResultsView(history: history)
             }
@@ -39,10 +39,10 @@ struct ContentView: View {
             chat.attachHistory(history)
         }
         .onChange(of: selectedTab) { _, newValue in
-            if newValue != 1 {
+            if newValue != 1 && !rag.isBusy {
                 rag.unloadEmbedder()
             }
-            if newValue == 1 {
+            if newValue == 1 && !chat.isBusy {
                 chat.unloadModel()
             }
         }
@@ -142,7 +142,7 @@ struct ContentView: View {
         HStack(spacing: 0) {
             tabButton(title: "Sohbet", icon: "bubble.left.and.bubble.right.fill", index: 0)
             tabButton(title: "RAG", icon: "doc.text.magnifyingglass", index: 1)
-            tabButton(title: "Jev", icon: "point.3.connected.trianglepath.dotted", index: 2)
+            tabButton(title: "Laboratuvar", icon: "flask.fill", index: 2)
             tabButton(title: "Sonuçlar", icon: "chart.bar.xaxis", index: 3)
         }
         .padding(.top, 9)
