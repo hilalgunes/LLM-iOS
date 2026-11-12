@@ -308,10 +308,7 @@ struct RAGView: View {
                     } label: {
                         VStack(alignment: .leading, spacing: 4) {
                             HStack {
-                                Text("[\(index + 1)] \(source.sourceName)")
-                                if let page = source.pageNumber {
-                                    Text("· sayfa \(page)")
-                                }
+                                Text("[\(index + 1)] \(rag.sourceLabel(for: source))")
                                 Spacer()
                                 Image(systemName: "arrow.up.right.square")
                             }

@@ -32,9 +32,23 @@ actor RAGDocumentStore {
 
     func load() throws -> [RAGChunk] {
         do {
-            return try JSONDecoder().decode([RAGChunk].self, from: Data(contentsOf: indexURL))
+            let chunks = try JSONDecoder().decode([RAGChunk].self, from: Data(contentsOf: indexURL))
+            cleanupOrphanedSources(referencedBy: chunks)
+            return chunks
         } catch CocoaError.fileReadNoSuchFile {
             return []
+        }
+    }
+
+    private func cleanupOrphanedSources(referencedBy chunks: [RAGChunk]) {
+        let referenced = Set(chunks.compactMap(\.sourceStorageName))
+        guard let files = try? FileManager.default.contentsOfDirectory(at: sourceDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]) else { return }
+        for file in files where !referenced.contains(file.lastPathComponent) {
+            guard UUID(uuidString: file.deletingPathExtension().lastPathComponent) != nil,
+                  let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey]),
+                  values.isRegularFile == true, values.isSymbolicLink != true else { continue }
+            try? FileManager.default.removeItem(at: file)
         }
     }
 
@@ -90,6 +104,7 @@ actor RAGDocumentStore {
             // A leftover original is harmless; a committed index must still reach the UI.
             try? FileManager.default.removeItem(at: sourceDirectory.appendingPathComponent(storedName))
         }
+        cleanupOrphanedSources(referencedBy: remaining)
         return remaining
     }
 }

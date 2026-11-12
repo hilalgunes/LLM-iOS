@@ -88,6 +88,13 @@ final class LocalRAGModel {
         }.sorted { ($0.name, $0.id) < ($1.name, $1.id) }
     }
 
+    func sourceLabel(for chunk: RAGChunk) -> String {
+        let siblings = chunks.filter { $0.documentID == chunk.documentID }
+        let part = siblings.firstIndex { $0.id == chunk.id }.map { " · Parça \($0 + 1)" } ?? ""
+        let page = chunk.pageNumber.map { " · Sayfa \($0)" } ?? ""
+        return chunk.sourceName + part + page
+    }
+
     var indexedChunkCount: Int {
         chunks.filter { $0.embedding != nil }.count
     }
@@ -126,6 +133,10 @@ final class LocalRAGModel {
         do {
             try await documentStore.save(updated)
             chunks = updated
+            answer = ""
+            sources = []
+            selectedSource = nil
+            embeddingComparison = []
             selectedEmbedding = choice
             UserDefaults.standard.set(choice.rawValue, forKey: embeddingPreferenceKey)
             unloadEmbedder()
@@ -233,7 +244,7 @@ final class LocalRAGModel {
             }
             sources = matches
             let context = matches.enumerated().map { index, chunk in
-                "[Kaynak \(index + 1): \(chunk.sourceName)]\n\(chunk.text)"
+                "[Kaynak \(index + 1): \(sourceLabel(for: chunk))]\n\(chunk.text)"
             }.joined(separator: "\n\n")
 
             unloadEmbedder()
@@ -250,7 +261,7 @@ final class LocalRAGModel {
                 prompt: question,
                 answer: answer,
                 details: matches.enumerated().map { index, chunk in
-                    "[\(index + 1)] \(chunk.sourceName)\n\(chunk.text)"
+                    "[\(index + 1)] \(sourceLabel(for: chunk))\n\(chunk.text)"
                 }.joined(separator: "\n\n"),
                 modelName: chat.selectedModel.title,
                 totalDurationSeconds: completion.totalDurationSeconds,

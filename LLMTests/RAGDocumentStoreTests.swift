@@ -81,6 +81,34 @@ final class RAGDocumentStoreTests: XCTestCase {
         XCTAssertEqual(reloaded.documents.map(\.id), [second.documentID])
     }
 
+    func testOrphanCleanupOnlyAfterValidIndexLoad() async throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = RAGDocumentStore(directory: root)
+        try FileManager.default.createDirectory(at: store.sourceDirectory, withIntermediateDirectories: true)
+        let orphan = store.sourceDirectory.appendingPathComponent("\(UUID().uuidString).txt")
+        let unknown = store.sourceDirectory.appendingPathComponent("keep.txt")
+        try Data("orphan".utf8).write(to: orphan)
+        try Data("unknown".utf8).write(to: unknown)
+        try Data("broken".utf8).write(to: root.appendingPathComponent("rag-index.json"))
+        do { _ = try await store.load(); XCTFail("Broken index should fail") } catch {}
+        XCTAssertTrue(FileManager.default.fileExists(atPath: orphan.path))
+        try await store.save([])
+        _ = try await store.load()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: orphan.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unknown.path))
+    }
+
+    func testSourceLabelIncludesDocumentPartAndPage() async throws {
+        let root = try directory()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let model = LocalRAGModel(directory: root)
+        await model.waitUntilLoaded()
+        model.chunks = [RAGChunk(id: UUID(), sourceName: "notes.pdf", text: "First", sourceStorageName: "one.pdf", pageNumber: 2),
+                        RAGChunk(id: UUID(), sourceName: "notes.pdf", text: "Second", sourceStorageName: "one.pdf", pageNumber: 3)]
+        XCTAssertEqual(model.sourceLabel(for: model.chunks[1]), "notes.pdf · Parça 2 · Sayfa 3")
+    }
+
     func testLegacyIndexLoadsAndRemovalPersists() async throws {
         let root = try directory()
         defer { try? FileManager.default.removeItem(at: root) }
